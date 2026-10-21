@@ -1,0 +1,7 @@
+interface:
+  display_name: "Orange Note"
+  short_description: "Browser-based agent operations for Jupyter workspaces"
+  default_prompt: "Use $orange-note-skill to connect to the supported workspace URL I provide and perform the requested operation."
+
+policy:
+  allow_implicit_invocation: false
