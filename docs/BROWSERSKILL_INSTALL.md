@@ -25,13 +25,15 @@ a daemon that other tasks are using.
 Open and log into the supported target workspace yourself. When it is ready:
 
 ```bash
-python scripts/sn.py connect --url "<supported workspace URL>"
-python scripts/sn.py probe
+python scripts/sn.py session create --url "<your supported workspace URL>"
+python scripts/sn.py --session <returned-logical-id> probe
 ```
 
 The controller operates its own Agent Window. A reaped session may be rebuilt
 from the saved workspace. An expired login needs attention in the original
 browser profile. Use `doctor --deep` to distinguish the failed layer.
 
-When done, `python scripts/sn.py close` cleans up the controller's recorded
-kernel and session. Use separate `SN_CONFIG_DIR` values for independent tasks.
+Use your own URL; IDs are parsed from it and stored in your local session config.
+Keep the returned logical ID for this conversation and pass it on each command.
+When done, `python scripts/sn.py --session <id> close` cleans up that controller's
+recorded kernel and browser session. Other conversations use their own logical IDs.

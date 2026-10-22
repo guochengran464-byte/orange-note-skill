@@ -17,10 +17,19 @@ self-hosted Jupyter servers require a connector adaptation.
 The connector uses `bsk session`, `tab`, `navigate` and main-frame `evaluate`.
 Browser state and sessions are isolated by workspace. A controller-owned Jupyter
 kernel handles execution and atomic writes; file APIs handle small reads and ranged downloads.
+v4.1.0 adds explicit conversation sessions on top of that engine. Focused local
+checks cover session management and Windows file locking. Three Luna agents
+also passed live isolation, persistence, overlapping execution and independent
+cleanup with BrowserSkill CLI/extension 0.3.3 and Edge 155.0.0.0.
+POSIX controller locking and heavy-load capacity remain unverified for this release.
+
+Each user supplies their own supported workspace URL. Project/workspace IDs and
+browser state are stored in local user/session config, never in shipped defaults.
 
 The default server paths are `/data/work` and `/data/work/agent_jobs`. A different
 server layout needs corresponding connector/path adaptation; changing a label
 alone does not establish compatibility.
 
-See `docs/VALIDATION_v4.0.1.md` for completed checks. If connection checks fail,
+See `docs/VALIDATION_v4.1.0.md` for this release and `docs/VALIDATION_v4.0.1.md`
+for historical engine checks. If connection checks fail,
 report the actual failed layer and sanitized CLI output.

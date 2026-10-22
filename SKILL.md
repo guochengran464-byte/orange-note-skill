@@ -7,7 +7,7 @@ description: >
   when the user requests Orange Note or authorizes operations in that workspace.
 ---
 
-# Orange Note — v4.0.1
+# Orange Note — v4.1.0
 
 Use the bundled CLI for repeatable Agent operations through BrowserSkill and the
 current user's browser login. This release uses the built-in workspace connector;
@@ -17,9 +17,17 @@ arbitrary websites and self-hosted notebook servers need a matching connector.
 
 1. Run `python scripts/sn.py doctor` and resolve failed prerequisites.
 2. For first use or a target change, obtain the URL of the workspace the user opened.
-3. Run `python scripts/sn.py connect --url "<supported workspace URL>"`.
-4. Use `probe` or a requested read to confirm the connection. A later `connect`
-   may recover only the successfully saved target.
+   Each user supplies their own URL. Derive project/workspace IDs from that URL;
+   keep them only in that user's local session config, outside the skill package.
+3. For each independent conversation or agent, run
+   `python scripts/sn.py session create --url "<supported workspace URL>"` once.
+   Save the returned `logical_session_id` in the conversation and handoff.
+4. Pass `--session <id>` before the command on every later invocation. Reuse the
+   ID within this conversation; create a different ID for another conversation,
+   agent or workspace. There is no global current session.
+5. Use `--session <id> probe` or a requested read to confirm the connection.
+   If creation fails after allocating an ID, retain that ID and recover using
+   `--session <id> connect`. Use `session list` to find saved IDs; it is not a live probe.
 
 Use Windows Python, an already logged-in Edge/Chrome profile, BrowserSkill CLI,
 and its connected extension. Operate only controller-owned Agent Window tabs.
@@ -28,22 +36,22 @@ Keep the CLI, runtime JavaScript, metadata and documents together when installin
 ## Commands
 
 ```bash
-python scripts/sn.py doctor --deep
-python scripts/sn.py ls work/project
-python scripts/sn.py cat work/project/run.py
-python scripts/sn.py write work/project/note.txt --content "hello"
-python scripts/sn.py get work/project/figure.png --out ./figure.png
-python scripts/sn.py put ./report.pdf --remote work/project/report.pdf
-python scripts/sn.py inspect /data/work/project/data.h5ad
-python scripts/sn.py run-python --code "print(1 + 1)"
-python scripts/sn.py run-shell --cwd /data/work/project --cmd "python check.py"
-python scripts/sn.py submit --cwd /data/work/project --cmd "python pipeline.py" --idempotency-key project-run-1
-python scripts/sn.py jobs --remote
-python scripts/sn.py poll <job_id>
-python scripts/sn.py artifacts <job_id>
-python scripts/sn.py cancel <job_id>
-python scripts/sn.py accept <job_id> --note "results reviewed"
-python scripts/sn.py close
+python scripts/sn.py --session <id> doctor --deep
+python scripts/sn.py --session <id> ls work/project
+python scripts/sn.py --session <id> cat work/project/run.py
+python scripts/sn.py --session <id> write work/project/note.txt --content "hello"
+python scripts/sn.py --session <id> get work/project/figure.png --out ./figure.png
+python scripts/sn.py --session <id> put ./report.pdf --remote work/project/report.pdf
+python scripts/sn.py --session <id> inspect /data/work/project/data.h5ad
+python scripts/sn.py --session <id> run-python --code "print(1 + 1)"
+python scripts/sn.py --session <id> run-shell --cwd /data/work/project --cmd "python check.py"
+python scripts/sn.py --session <id> submit --cwd /data/work/project --cmd "python pipeline.py" --idempotency-key <id>:project-run-1
+python scripts/sn.py --session <id> jobs --remote
+python scripts/sn.py --session <id> poll <job_id>
+python scripts/sn.py --session <id> artifacts <job_id>
+python scripts/sn.py --session <id> cancel <job_id>
+python scripts/sn.py --session <id> accept <job_id> --note "results reviewed"
+python scripts/sn.py --session <id> close
 ```
 
 `work/...` maps to `/data/work/...`; shell cwd defaults to `/data/work`.
@@ -63,7 +71,16 @@ previews and external mounts use bounded kernel helpers.
   large scientific objects; `inspect` summarizes supported formats without transferring matrices.
 - Reuse only the controller's own kernel. Runtime reinjection retains its queue;
   ownership is scoped to the page/workspace in sessionStorage. Close the session when finished.
-- Keep each independent Agent task in its own `SN_CONFIG_DIR`.
+- Logical sessions have separate config, browser state and receipts under
+  `<SN_CONFIG_DIR>/sessions/<id>` (or the default user config root). Set a stable
+  `SN_CONFIG_DIR` on every call if choosing a custom root. Commands without an ID
+  retain legacy shared-state behavior; use explicit sessions for concurrent work.
+- A process lock serializes commands within one logical session; `session_busy`
+  means another command still holds it. Different sessions have separate locks.
+  Closing releases this session's browser resources, keeping its ID/config and
+  detached jobs available for recovery. A recreated page may lose Python variables.
+- Sessions share server files, account permissions and compute resources. Use
+  separate project/output paths for independent work.
 
 ## Job recovery
 
@@ -74,6 +91,9 @@ Do not blindly replay an execution or submission after a timeout.
 An idempotency key is scoped to the selected workspace. Reusing the same key and
 command/cwd returns the original job; a changed command/cwd reports
 `idempotency_conflict`. Changing the display name does not change the job ID.
+For independent runs include the logical ID in the key. Cross-session same-key
+submissions can report an existing remote directory; inspect that job ID with
+`poll` instead of retrying. `jobs --remote` shows the workspace's shared jobs.
 
 Track process state, task-owned `stage.json` and human acceptance separately.
 Do not call a stale status file proof that a process is alive. Cancellation must
@@ -95,4 +115,4 @@ only to the saved target or a newly supplied URL. Installation, destructive
 changes, permission expansion and process termination follow user authorization.
 
 For installation, support limits and verified scenarios, read `README.md`,
-`COMPATIBILITY.md`, `SECURITY.md` and `docs/VALIDATION_v4.0.1.md` as needed.
+`COMPATIBILITY.md`, `SECURITY.md` and `docs/VALIDATION_v4.1.0.md` as needed.

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Orange Note browser-backed agent operations, v4.0.1.
+"""Orange Note browser-backed agent operations, v4.1.0.
 Provides file inspection/transfer, bounded execution and persistent jobs through
 the built-in Jupyter workspace connector. Browser credentials stay in the page.
 The existing sn.py filename and runtime configuration remain compatible.
 """
 from __future__ import annotations
-import argparse, base64, binascii, hashlib, json, os, posixpath, re, shlex, shutil, subprocess, sys, time, uuid
+import argparse, base64, binascii, errno, hashlib, json, os, posixpath, re, shlex, shutil, subprocess, sys, time, uuid
+from contextlib import contextmanager
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.dirname(HERE)
 RUNTIME_JS_PATH = os.path.join(HERE, "jupyter_runtime.js")
-CONTROLLER_VERSION = "4.0.1"
+CONTROLLER_VERSION = "4.1.0"
+LOGICAL_SESSION_ID = None
+_ACTIVE_BROWSER_SESSION = None
 
 
 DEFAULT_CFG = {
@@ -23,7 +26,7 @@ CONFIG_EXAMPLE_PATH = os.path.join(SKILL_DIR, "config.example.json")
 LEGACY_CONFIG_PATH = os.path.join(SKILL_DIR, "config.json")
 
 
-def config_path():
+def _base_config_path():
     """Return a per-user config path, never a path inside the Git checkout."""
     override = os.environ.get("SN_CONFIG_DIR")
     if override:
@@ -33,6 +36,25 @@ def config_path():
     else:
         base = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "stereonote")
     return os.path.join(base, "config.json")
+
+
+def config_path():
+    if LOGICAL_SESSION_ID:
+        return os.path.join(_logical_dir(LOGICAL_SESSION_ID), "config.json")
+    return _base_config_path()
+
+
+def _logical_dir(session_id):
+    try:
+        if str(uuid.UUID(session_id)) != session_id:
+            raise ValueError("invalid_session_id")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("invalid_session_id") from exc
+    root = os.path.realpath(os.path.join(os.path.dirname(_base_config_path()), "sessions"))
+    path = os.path.realpath(os.path.join(root, session_id))
+    if os.path.commonpath((root, path)) != root:
+        raise ValueError("invalid_session_directory")
+    return path
 
 
 def _read_json(path):
@@ -50,7 +72,8 @@ def _load_cfg():
     cfg = dict(DEFAULT_CFG)
     cfg.update(_read_json(CONFIG_EXAMPLE_PATH))
     # Backward-compatible read only. v3.2 never writes this legacy repo-local file.
-    cfg.update(_read_json(LEGACY_CONFIG_PATH))
+    if not LOGICAL_SESSION_ID:
+        cfg.update(_read_json(LEGACY_CONFIG_PATH))
     cfg.update(_read_json(config_path()))
     return cfg
 
@@ -88,34 +111,43 @@ def canonical_workspace_url(url):
     return _build_workspace_url(*_workspace_ids(url))
 
 
-CFG = _load_cfg()
-BSK_BIN = (os.environ.get("BSK_BIN") or CFG.get("bsk_bin") or
-           shutil.which("bsk") or
-           os.path.join(os.path.expanduser("~"), ".local", "bin",
-                        "bsk.exe" if os.name == "nt" else "bsk"))
-_raw_env_url = os.environ.get("SN_URL", "").strip()
-if _raw_env_url:
-    try:
-        WORKSPACE_URL = canonical_workspace_url(_raw_env_url)
-        WORKSPACE_URL_ERROR = None
-    except ValueError as exc:
-        WORKSPACE_URL = ""
-        WORKSPACE_URL_ERROR = str(exc)
-else:
+def _configure_runtime():
+    global CFG, BSK_BIN, WORKSPACE_URL, WORKSPACE_URL_ERROR, WORK_ROOT
+    CFG = _load_cfg()
+    BSK_BIN = (os.environ.get("BSK_BIN") or CFG.get("bsk_bin") or shutil.which("bsk") or
+               os.path.join(os.path.expanduser("~"), ".local", "bin",
+                            "bsk.exe" if os.name == "nt" else "bsk"))
     WORKSPACE_URL = _build_workspace_url(CFG.get("project_id", ""), CFG.get("workspace_id", ""))
-    # Legacy read support: sanitize an old workspace_url in memory, but never rewrite it here.
     WORKSPACE_URL_ERROR = None
     if not WORKSPACE_URL and CFG.get("workspace_url"):
         try:
             WORKSPACE_URL = canonical_workspace_url(CFG.get("workspace_url"))
         except ValueError as exc:
             WORKSPACE_URL_ERROR = str(exc)
+    raw_url = os.environ.get("SN_URL", "").strip()
+    if raw_url:
+        try:
+            env_url = canonical_workspace_url(raw_url)
+            if LOGICAL_SESSION_ID and env_url != WORKSPACE_URL:
+                raise ValueError("session_workspace_mismatch: SN_URL differs from the bound workspace")
+            WORKSPACE_URL = env_url
+        except ValueError as exc:
+            if LOGICAL_SESSION_ID:
+                raise
+            WORKSPACE_URL, WORKSPACE_URL_ERROR = "", str(exc)
+    WORK_ROOT = CFG.get("work_root", "/data/work").rstrip("/")
+
+
+_configure_runtime()
 
 
 def set_runtime_url(url):
     """Validate a workspace URL and use its canonical form for this process only."""
     global WORKSPACE_URL, WORKSPACE_URL_ERROR
-    WORKSPACE_URL = canonical_workspace_url(url)
+    target = canonical_workspace_url(url)
+    if LOGICAL_SESSION_ID and target != WORKSPACE_URL:
+        raise ValueError("session_workspace_mismatch: create another session for a different workspace")
+    WORKSPACE_URL = target
     WORKSPACE_URL_ERROR = None
     return WORKSPACE_URL
 
@@ -123,6 +155,7 @@ def set_runtime_url(url):
 def save_url(url):
     """Persist only DCS project/workspace identifiers in a per-user config file."""
     global WORKSPACE_URL, WORKSPACE_URL_ERROR, CFG
+    set_runtime_url(url)
     project_id, workspace_id = _workspace_ids(url)
     WORKSPACE_URL = _build_workspace_url(project_id, workspace_id)
     WORKSPACE_URL_ERROR = None
@@ -173,6 +206,97 @@ _JOB_ID_RE = re.compile(
 
 class Bridge(RuntimeError):
     pass
+
+
+@contextmanager
+def _controller_lock(directory, timeout=10):
+    with open(os.path.join(directory, "controller.lock"), "a+b") as lock:
+        if os.fstat(lock.fileno()).st_size == 0:
+            lock.write(b"\0")
+            lock.flush()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                lock.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise Bridge("session_busy: another command is using this session") from exc
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def selected_session(session_id):
+    if session_id is None:
+        yield
+        return
+    directory = _logical_dir(session_id)
+    if not os.path.isfile(os.path.join(directory, "config.json")):
+        raise ValueError("unknown_session: use session create first")
+    with _controller_lock(directory):
+        keys = ("LOGICAL_SESSION_ID", "_ACTIVE_BROWSER_SESSION", "CFG", "BSK_BIN",
+                "WORKSPACE_URL", "WORKSPACE_URL_ERROR", "WORK_ROOT")
+        previous = {key: globals()[key] for key in keys}
+        try:
+            globals().update(LOGICAL_SESSION_ID=session_id, _ACTIVE_BROWSER_SESSION=None)
+            _configure_runtime()
+            if not WORKSPACE_URL:
+                raise ValueError("session_workspace_missing")
+            yield
+        finally:
+            globals().update(previous)
+
+
+def create_logical_session(url):
+    project_id, workspace_id = _workspace_ids(url)
+    session_id = str(uuid.uuid4())
+    directory = _logical_dir(session_id)
+    os.makedirs(directory, mode=0o700, exist_ok=False)
+    cfg = {key: CFG.get(key, DEFAULT_CFG[key]) for key in ("work_root", "bsk_bin")}
+    cfg.update(project_id=project_id, workspace_id=workspace_id, created_at=_utc_now())
+    path = os.path.join(directory, "config.json")
+    with open(path, "x", encoding="utf-8") as fh:
+        json.dump(cfg, fh, ensure_ascii=False, indent=2)
+    os.chmod(path, 0o600)
+    return session_id
+
+
+def list_logical_sessions():
+    root = os.path.join(os.path.dirname(_base_config_path()), "sessions")
+    rows = []
+    if not os.path.isdir(root):
+        return {"ok": True, "sessions": rows}
+    for name in sorted(os.listdir(root)):
+        try:
+            directory = _logical_dir(name)
+        except ValueError:
+            continue
+        cfg = _read_json(os.path.join(directory, "config.json"))
+        url = _build_workspace_url(cfg.get("project_id"), cfg.get("workspace_id"))
+        if not url:
+            continue
+        suffix = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+        state = _read_json(os.path.join(directory, "browser-" + suffix + ".json"))
+        rows.append({"logical_session_id": name, "workspace_url": url, "state_dir": directory,
+                     "created_at": cfg.get("created_at"), "browser_session_id": state.get("session_id"),
+                     "tab_id": state.get("tab_id"), "updated_at": state.get("updated_at")})
+    return {"ok": True, "sessions": rows, "note": "saved state only; use --session ID probe for live status"}
 
 
 def validate_job_id(value):
@@ -486,6 +610,7 @@ def _browser_state():
 def _save_browser_state(**updates):
     state = _browser_state()
     state.update(updates)
+    state["updated_at"] = _utc_now()
     path = _browser_state_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + "." + uuid.uuid4().hex + ".tmp"
@@ -538,14 +663,21 @@ def _session_ids():
 
 def ensure_session(force=False):
     """Reuse the recorded bsk session, else start one (bsk reaps idle sessions)."""
+    global _ACTIVE_BROWSER_SESSION
+    if LOGICAL_SESSION_ID and _ACTIVE_BROWSER_SESSION and not force:
+        return _ACTIVE_BROWSER_SESSION
     session_id = _browser_state().get("session_id")
     if session_id and not force and session_id in _session_ids():
+        if LOGICAL_SESSION_ID:
+            _ACTIVE_BROWSER_SESSION = session_id
         return session_id
     started = bsk("session", "start", timeout=120)
     session_id = started.get("session_id") if isinstance(started, dict) else None
     if not session_id:
         raise Bridge("bsk_session_start_failed: 未返回 session_id")
     _save_browser_state(session_id=session_id, tab_id=None, task_base=None)
+    if LOGICAL_SESSION_ID:
+        _ACTIVE_BROWSER_SESSION = session_id
     return session_id
 
 
@@ -584,6 +716,8 @@ def _runtime():
 
 def _call_js(op, payload, tab_id, timeout, session_id=None):
     """Run one runtime op; large payloads are transferred in chunks to fit argv limits."""
+    if LOGICAL_SESSION_ID and session_id is None:
+        session_id = ensure_session()
     call = ("(async () => { return await window.__codexJupyter(%s, %s); })()"
             % (json.dumps(op), json.dumps(payload)))
     expression = _runtime() + "\n;" + call
@@ -1862,7 +1996,7 @@ def close_tabs():
     tab_id = state.get("tab_id")
     if tab_id is not None and session_id in _session_ids():
         try:
-            kernels = (_call_js("cleanup", {}, tab_id, 30) or {}).get("data")
+            kernels = (_call_js("cleanup", {}, tab_id, 30, session_id) or {}).get("data")
         except Bridge:
             kernels = None
     try:
@@ -2012,6 +2146,9 @@ def doctor(deep=False):
 # ─────────────────────────── CLI ───────────────────────────
 def _print(o):
     """Write UTF-8 JSON regardless of the Windows console code page."""
+    if LOGICAL_SESSION_ID and isinstance(o, dict):
+        o = dict(o, logical_session_id=LOGICAL_SESSION_ID,
+                 state_dir=os.path.dirname(config_path()))
     text = json.dumps(o, ensure_ascii=False, indent=2) + "\n"
     stream = getattr(sys.stdout, "buffer", None)
     if stream is None:
@@ -2049,7 +2186,14 @@ def _emit(result, failure_code=1):
 
 def main(argv):
     ap = argparse.ArgumentParser(description=f"Orange Note agent operations for Jupyter workspaces (v{CONTROLLER_VERSION})")
+    ap.add_argument("--session", help="logical session ID returned by session create (place before the command)")
     sub = ap.add_subparsers(dest="subcmd", required=True)
+
+    p = sub.add_parser("session", help="create or list independent conversation sessions")
+    sessions = p.add_subparsers(dest="session_command", required=True)
+    p = sessions.add_parser("create", help="allocate an independent session and connect; retain its ID on failure")
+    p.add_argument("--url", required=True, help="user-selected supported workspace URL")
+    sessions.add_parser("list", help="list saved logical sessions without contacting the browser")
 
     p = sub.add_parser("connect", help="connect only to the user-selected workspace URL and confirm its iframe")
     p.add_argument("--url", help="current workspace URL copied after the user manually opens Personal Analysis; "
@@ -2119,6 +2263,25 @@ def main(argv):
     sub.add_parser("close", help="stop the controller bsk session (closes its Agent Window tab)")
 
     a = ap.parse_args(argv)
+    session_id = a.session
+    try:
+        if a.subcmd == "session":
+            if session_id:
+                raise ValueError("session_management_does_not_take_session_id")
+            if a.session_command == "list":
+                return _emit(list_logical_sessions())
+            session_id = create_logical_session(a.url)
+            a.subcmd, a.url = "connect", None
+        with selected_session(session_id):
+            return _dispatch(a)
+    except (Bridge, ValueError, OSError) as exc:
+        result = {"ok": False, "error": str(exc)}
+        if session_id:
+            result["logical_session_id"] = session_id
+        return _emit(result, failure_code=2 if isinstance(exc, ValueError) else 1)
+
+
+def _dispatch(a):
     try:
         if a.subcmd == "status":
             try:
@@ -2129,11 +2292,12 @@ def main(argv):
             supplied_url = canonical_workspace_url(a.url) if getattr(a, "url", None) else None
             if supplied_url:
                 set_runtime_url(supplied_url)
-            tab_id = ensure_tab(force=bool(supplied_url), full_probe=True)
+            tab_id = ensure_tab(force=bool(supplied_url) and not LOGICAL_SESSION_ID, full_probe=True)
             if supplied_url:
                 save_url(supplied_url)
             state = _browser_state()
-            _print({"ok": True, "session_id": state.get("session_id"), "tab_id": tab_id,
+            _print({"ok": True, "session_id": state.get("session_id"),
+                    "browser_session_id": state.get("session_id"), "tab_id": tab_id,
                     "task_base": state.get("task_base"), "url_saved": bool(supplied_url)})
         elif a.subcmd == "probe":
             _print(evaluate_op("probe", {}))

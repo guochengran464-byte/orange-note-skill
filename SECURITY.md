@@ -7,6 +7,9 @@ selected browser workspace. Code execution is real account access, not an OS san
   `_xsrf` stay inside the browser; they are not exported to the Agent.
 - A successfully saved workspace is the recovery target. Different workspaces use
   separate browser state/sessions, kernels and resume identities.
+- Explicit logical sessions also separate conversations using the same workspace.
+  Session IDs select local state; they are not authentication credentials or an
+  account-level sandbox. Server files, permissions, compute and remote jobs remain shared.
 - New writes/uploads use exclusive server-side creation and readback verification.
   Default downloads publish without replacing an existing local destination.
 - Background-job records use private permissions. Commands are retained in the

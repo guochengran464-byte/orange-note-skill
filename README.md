@@ -6,7 +6,7 @@ Orange Note 是面向 Claude Code、Codex 等 Agent 的通用操作技能。它�
 有界执行和任务跟踪整理成一组 CLI 命令，通过 BrowserSkill 使用已有浏览器登录状态，
 在受支持的 Jupyter 工作区中完成操作，无需向 Agent 复制登录凭据。
 
-**版本：v4.0.1 · 许可证：MIT**
+**版本：v4.1.0 · 许可证：MIT**
 
 ## 能做什么
 
@@ -39,6 +39,36 @@ Codex:       ~/.agents/skills/orange-note-skill/
 Codex 的默认提示可显式调用 `$orange-note-skill`；技能默认关闭隐式调用。
 
 ## 快速开始
+
+### 独立对话 / 多 Agent
+
+每个对话创建一次独立 session；相同工作区也可以创建多个：
+
+**每个用户都使用自己的工作区 URL。** 项目 ID 和工作区 ID 从 `--url` 动态解析，
+只保存在该用户的本地 session 配置中；发布包不包含默认工作区或任何人的实际工作区信息。
+
+```bash
+python scripts/sn.py session create --url "<支持的工作区 URL>"
+python scripts/sn.py --session <返回的logical_session_id> run-python --code "print(1 + 1)"
+python scripts/sn.py --session <返回的logical_session_id> connect
+python scripts/sn.py --session <返回的logical_session_id> close
+python scripts/sn.py session list
+```
+
+后续每条命令都在子命令前带 `--session <id>`。不同 session 独享本地配置、回执、
+BrowserSkill session、控制页和内核；同 session 的命令用进程锁协调，等待 10 秒仍被占用则返回
+`session_busy`。没有全局“当前 session”，不同 agent 可以各自保存 ID。
+
+创建失败也会返回已分配的 ID，可用该 ID 的 `connect` 恢复。`close` 保留配置和后台任务；
+之后仍能用同一 ID 连接。浏览器重建后 Python 内存变量可能丢失。
+`session list` 显示本地保存记录，实时状态用 `--session <id> probe` 检查。
+
+默认状态根目录沿用旧版用户配置位置。要把状态放在 D:，在每次命令的环境中设置
+`SN_CONFIG_DIR=D:\orange-note-state`；各 session 位于该目录的 `sessions/<id>/`。
+同一 session 绑定一个工作区；换工作区创建新 session。服务器文件和算力仍然共享，
+独立任务应使用不同输出目录和包含 session ID 的幂等键。`jobs --remote` 是工作区共享视图。
+
+### 旧命令兼容
 
 在已登录的浏览器中打开目标工作区，等待启动，复制当前地址：
 
@@ -103,7 +133,7 @@ python scripts/sn.py close
 - 不导出浏览器 cookies、token 或 `_xsrf`；运行配置和任务回执不应提交到 Git。
 - 单次同步执行最长 50 秒，更长任务使用 `submit`；上传上限 4 MiB。
 - 下载按 256 KiB 分块。默认对不超过 64 MiB 的文件核对远端 SHA-256；更大文件报告 `size_only`。
-- 独立 Agent 任务使用各自的 `SN_CONFIG_DIR`。删除、覆盖和取消任务仍以用户授权为准。
+- 多对话使用独立逻辑 session；不带 `--session` 的旧命令仍使用共享状态。删除、覆盖和取消任务仍以用户授权为准。
 
 ## 测试
 
@@ -114,5 +144,7 @@ node --check scripts/jupyter_runtime.js
 node --test tests/runtime.test.cjs
 ```
 
-核心版本已经完成 Windows / Linux 回归与浏览器工作区实测。测试范围和未验证场景见
-[验证记录](docs/VALIDATION_v4.0.1.md)，版本变化见 [CHANGELOG.md](CHANGELOG.md)。
+v4.1.0 已完成少量针对性检查，以及 3 个 Luna Agent 进入同一工作区的真实浏览器实测：
+独立内核、变量保留、重叠执行和关闭一个 session 不影响其他 session 均通过。
+本版范围见 [验证记录](docs/VALIDATION_v4.1.0.md)，旧引擎的历史验证见
+[v4.0.1 记录](docs/VALIDATION_v4.0.1.md)，版本变化见 [CHANGELOG.md](CHANGELOG.md)。

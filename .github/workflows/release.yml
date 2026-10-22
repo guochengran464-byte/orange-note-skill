@@ -1,0 +1,38 @@
+name: Publish versioned release
+
+on:
+  push:
+    branches: [main]
+    paths: [scripts/sn.py, .github/workflows/release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the declared version once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python -c "import runpy; print(runpy.run_path('scripts/sn.py')['CONTROLLER_VERSION'])")
+          tag="v$version"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; leaving it unchanged."
+            exit 0
+          fi
+          notes="docs/RELEASE_$tag.md"
+          test -f "$notes"
+          archive="$RUNNER_TEMP/orange-note-skill-$tag.zip"
+          git archive --format=zip --prefix=orange-note-skill/ --output="$archive" HEAD
+          gh release create "$tag" "$archive" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "Orange Note $tag" --notes-file "$notes"

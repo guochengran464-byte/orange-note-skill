@@ -22,5 +22,7 @@ build/
 # Runtime state and secrets
 browser*.json
 jobs/
+sessions/
+controller.lock
 .env
 .env.*

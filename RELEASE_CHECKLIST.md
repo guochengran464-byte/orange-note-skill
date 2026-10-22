@@ -1,4 +1,13 @@
-# v4.0.1 release checks
+# v4.1.0 release checks
+
+This release uses focused checks only. See `docs/VALIDATION_v4.1.0.md`.
+- [x] Focused local session checks and skill metadata validation.
+- [x] Three live Luna agents: separate sessions/tabs/kernels and retained variables.
+- [x] Overlapping execution and independent session closure.
+- [x] Public configuration contains no personal workspace IDs or saved browser state.
+- [ ] Heavy-load testing and a full local regression run were not requested.
+
+## Historical v4.0.1 checks
 
 - [x] Workspace/tab isolation, file no-clobber, queue/ownership, text fallback,
   idempotency/conflict handling and empty-file regressions covered.
