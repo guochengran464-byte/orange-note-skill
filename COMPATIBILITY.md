@@ -1,5 +1,9 @@
 # Compatibility
 
+v4.1.4 keeps independent conversation pages within a five-minute idle window.
+Its current validation scope is recorded in `docs/VALIDATION_v4.1.4.md`.
+The three-agent results below describe the earlier v4.1.0 release.
+
 Orange Note provides a reusable Agent operation interface, with a built-in
 connector for supported browser-hosted Jupyter workspaces. The current URL
 validator accepts that connector's workspace format. Arbitrary sites or
@@ -25,6 +29,11 @@ POSIX controller locking and heavy-load capacity remain unverified for this rele
 
 Each user supplies their own supported workspace URL. Project/workspace IDs and
 browser state are stored in local user/session config, never in shipped defaults.
+
+Pages are reused between operations and expire after about five idle minutes.
+The documented launch uses `--session-idle 5m`; a busy session does not renew an
+independent idle session. Browser/daemon failure, login expiry and server culling
+can interrupt earlier. A temporary failed probe keeps the existing page open.
 
 The default server paths are `/data/work` and `/data/work/agent_jobs`. A different
 server layout needs corresponding connector/path adaptation; changing a label

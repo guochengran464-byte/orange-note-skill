@@ -30,7 +30,9 @@
   }
 
   var B = discoverBase();
-  var runtimeKey = "4.0.1:" + B.basePath;
+  // Keep in sync with CONTROLLER_VERSION in sn.py. A stale value makes a reinjection
+  // of newer code a silent no-op, because the guard below returns early.
+  var runtimeKey = "4.1.4:" + B.basePath;
   if (window.__snRuntimeKey === runtimeKey && window.__codexJupyter) return;
   var apiUrl = function (p) { return B.baseUrl + String(p).replace(/^\//, ""); };
   var wsBase = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + B.basePath;
@@ -145,14 +147,15 @@
     var wsu = wsUrl("api/kernels/" + encodeURIComponent(kid) + "/channels") + "?session_id=" + sess;
     if (TOKEN) wsu += "&token=" + encodeURIComponent(TOKEN);
     var out = { ok: true, stdout: "", stderr: "", results: [], error: null, timedOut: false, kernel: kernel.created ? "created" : "reused", kernel_lost: false, stdout_truncated: false, stderr_truncated: false, results_truncated: false };
+    var ws = null;
     try {
-      await new Promise(function (resolve, reject) {
+      await new Promise(function (resolve) {
         var done = false, parentId = null;
-        var ws = new WebSocket(wsu);
+        ws = new WebSocket(wsu);
         var timer = setTimeout(function () {
           if (!done) { done = true; out.ok = false; out.timedOut = true;
             out.error = boundedError("TimeoutError", "kernel execution timed out", "");
-            try { ws.close(); } catch (e) {} resolve(); }
+            resolve(); }
         }, timeoutMs);
         ws.onopen = function () {
           var h = header("execute_request", sess);
@@ -163,15 +166,17 @@
                        user_expressions: {}, allow_stdin: false, stop_on_error: true }
           }));
         };
-        ws.onerror = function () { if (!done) { done = true; out.ok = false;
-          clearTimeout(timer); reject(new Error("ws_error")); } };
+        ws.onerror = function () { if (!done) { done = true; out.ok = false; out.kernel_lost = true;
+          out.error = boundedError("WebSocketError", "kernel channel failed; execution outcome unknown", "");
+          clearTimeout(timer); resolve(); } };
         ws.onclose = function () { if (!done) { done = true; out.ok = false; out.kernel_lost = true;
           out.error = boundedError("WebSocketClosed", "kernel channel closed before idle", "");
           clearTimeout(timer); resolve(); } };
         ws.onmessage = function (ev) {
+          if (done) return;
           var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
           var pid = m.parent_header && m.parent_header.msg_id;
-          if (parentId && pid && pid !== parentId) return;
+          if (!parentId || pid !== parentId) return;
           var t = m.header && m.header.msg_type, c = m.content || {};
           if (t === "stream") {
             var target = c.name === "stderr" ? "stderr" : "stdout";
@@ -195,6 +200,10 @@
         };
       });
     } finally {
+      if (ws) {
+        ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+        try { ws.close(); } catch (e) {}
+      }
       // A healthy kernel stays alive for the next call. Only a lost or timed-out one is
       // dropped: its leftover execution would otherwise block every later request.
       if (out.kernel_lost || out.timedOut) {
@@ -260,6 +269,13 @@
                                headers: { Range: "bytes=" + start + "-" + end } });
     if (r.status !== 206 && r.status !== 200) {
       return { ok: false, status: r.status, error: "range_failed" };
+    }
+    var expected = end - start + 1;
+    var declared = Number(r.headers.get("content-length"));
+    // Reject an ignored Range before buffering a potentially multi-GB response.
+    if ((r.status === 200 && (start !== 0 || declared !== expected)) || declared > expected) {
+      if (r.body) await r.body.cancel();
+      return { ok: false, status: r.status, error: "range_not_supported" };
     }
     var buf = new Uint8Array(await r.arrayBuffer());
     var bin = "";

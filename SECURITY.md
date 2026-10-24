@@ -10,12 +10,20 @@ selected browser workspace. Code execution is real account access, not an OS san
 - Explicit logical sessions also separate conversations using the same workspace.
   Session IDs select local state; they are not authentication credentials or an
   account-level sandbox. Server files, permissions, compute and remote jobs remain shared.
-- New writes/uploads use exclusive server-side creation and readback verification.
+- Writes/uploads verify a same-directory temporary file before atomic publication;
+  new destinations use no-clobber publication and authorized replacements preserve
+  the old file if staging or verification fails.
   Default downloads publish without replacing an existing local destination.
 - Background-job records use private permissions. Commands are retained in the
   job manifest and script, so never include credentials in a submitted command.
 - Kernel cleanup targets only locally recorded controller-owned kernels.
   Job cancellation checks the process's association with that job directory.
+- Pages are reused between operations and expire after about five idle minutes.
+  Release immediately only on the user's request. Session activity is independent;
+  the daemon-wide idle setting does not isolate server files or compute.
+- Cleanup is workspace-wide, including other sessions' finished jobs and their
+  artifacts. It requires matching job records and no live or unverifiable PID or
+  process group. Unknown records are retained; preview before authorized deletion.
 - Skill metadata disables implicit invocation. Run operations only within the
   human's authorized task, including explicit authorization for destructive changes.
 

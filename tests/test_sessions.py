@@ -34,7 +34,7 @@ class Sessions(unittest.TestCase):
         return rc, json.loads(out.getvalue())
 
     def test_two_conversations_close_and_recover_independently(self):
-        live, calls = {}, []
+        live, calls, navigations = {}, [], []
         sequence = iter(range(1, 20))
 
         def bsk(*args, session=None, tab_id=None, **kwargs):
@@ -48,6 +48,7 @@ class Sessions(unittest.TestCase):
             if args == ("tab", "list"):
                 return {"tabs": [live[session]]}
             if args[0] == "navigate":
+                navigations.append((session, tab_id, args[1]))
                 self.assertEqual(tab_id, live[session]["tab_id"])
                 live[session]["url"] = args[1]
                 return dict(live[session])
@@ -76,6 +77,16 @@ class Sessions(unittest.TestCase):
             for lid, marker in ((aid, "A"), (bid, "B")):
                 rc, result = self.cli("--session", lid, "run-python", "--code", marker)
                 self.assertEqual((rc, result["data"]["stdout"]), (0, marker))
+            initial_navigation_count = len(navigations)
+            for lid, original in ((aid, a), (bid, b)):
+                for _ in range(3):
+                    rc, result = self.cli('--session', lid, 'connect', '--url', URL)
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(result['browser_session_id'], original['browser_session_id'])
+                    self.assertEqual(result['tab_id'], original['tab_id'])
+            self.assertEqual(set(live), {a['browser_session_id'], b['browser_session_id']})
+            self.assertEqual(len(navigations), initial_navigation_count)
+            self.assertFalse(any(row[-1] == 'cleanup' for row in calls))
             self.assertEqual(self.cli("--session", aid, "close")[0], 0)
             self.assertIn(b["browser_session_id"], live)
             self.assertEqual(self.cli("--session", bid, "probe")[0], 0)
