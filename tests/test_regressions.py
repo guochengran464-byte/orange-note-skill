@@ -125,7 +125,7 @@ class Regressions(unittest.TestCase):
             sn.put_file(str(local), "work/result.bin")
         self.assertTrue(evaluate.called, "put must use the atomic kernel writer")
         code = evaluate.call_args.args[1]["code"]
-        self.assertIn("os.O_EXCL", code)
+        self.assertIn("os.link(_temp, _path)", code)
         self.assertIn("write_readback_mismatch", code)
 
     def test_atomic_binary_writer_roundtrips_and_preserves_a_competing_file(self):

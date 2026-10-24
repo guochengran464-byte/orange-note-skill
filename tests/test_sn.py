@@ -177,6 +177,60 @@ class JobLifecycleTests(unittest.TestCase):
         self.assertEqual(poll.call_args.args[0], job_id)
         self.assertIn("Rscript -e", submit.call_args.args[0])
 
+    def test_rds_inspection_does_not_reuse_a_path_based_idempotency_key(self):
+        job_id = "job_550e8400-e29b-41d4-a716-446655440000"
+        with patch.object(sn, "submit", return_value={"job_id": job_id}) as submit, \
+             patch.object(sn, "poll", return_value={
+                 "status": {"state": "finished", "exit_code": 0},
+                 "stdout_tail": "INSPECT_JSON={\"type\": \"generic\"}",
+                 "stderr_tail": "", "read_errors": {},
+             }):
+            sn.inspect_rds("/data/work/input.rds", timeout=1)
+            sn.inspect_rds("/data/work/input.rds", timeout=1)
+        self.assertEqual(submit.call_count, 2)
+        self.assertTrue(all('idempotency_key' not in call.kwargs for call in submit.call_args_list))
+
+    def test_rds_inspection_polls_a_fresh_result(self):
+        job_id = "job_550e8400-e29b-41d4-a716-446655440000"
+        with patch.object(sn, "submit", return_value={"job_id": job_id, "reused": False}), \
+             patch.object(sn, "poll", return_value={
+                 "status": {"state": "finished", "exit_code": 0},
+                 "stdout_tail": "INSPECT_JSON={\"n_cells\": 12}",
+                 "stderr_tail": "", "read_errors": {},
+             }) as poll:
+            self.assertEqual(sn.inspect_rds("/data/work/input.rds", timeout=1),
+                             {"n_cells": 12})
+        self.assertEqual(poll.call_count, 1)
+
+    def test_prune_preserves_remote_failure_instead_of_reporting_success(self):
+        with patch.object(sn, 'run_shell', return_value={
+                'ok': True, 'returncode': 0,
+                'stdout': 'PRUNE_JSON={"ok":false,"error":"prune_partial_failure","removed":0}'}):
+            result = sn.prune_jobs()
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['error'], 'prune_partial_failure')
+
+    def test_prune_rejects_nonzero_exit_even_with_a_success_frame(self):
+        with patch.object(sn, 'run_shell', return_value={
+                'ok': False, 'returncode': 1, 'stdout': 'PRUNE_JSON={"ok":true}'}):
+            self.assertFalse(sn.prune_jobs()['ok'])
+
+    def test_prune_reports_a_timeout_as_a_timeout(self):
+        with patch.object(sn, "run_shell", return_value={
+                "ok": False, "returncode": None, "stdout": "", "stderr": "",
+                "timedOut": True}):
+            result = sn.prune_jobs(days=30)
+        self.assertEqual(result["error"], "prune_timeout")
+        self.assertIn("50s", result["detail"])
+
+    def test_prune_rejects_an_out_of_range_age(self):
+        with patch.object(sn, "run_shell") as run:
+            for bad in (0, -1, 3651, True, "7"):
+                with self.subTest(bad=bad):
+                    with self.assertRaisesRegex(ValueError, "invalid_days"):
+                        sn.prune_jobs(days=bad)
+        run.assert_not_called()
+
     def test_poll_rejects_invalid_job_id_and_tail_before_remote_shell(self):
         with patch.object(sn, "run_shell") as run:
             with self.assertRaises(ValueError):
@@ -497,13 +551,16 @@ class LayeredDiagnosticsTests(unittest.TestCase):
             raise AssertionError(args)
         return fake
 
-    def _deep(self, state=None, probe=True, probe_error=None, **kwargs):
+    def _deep(self, state=None, probe=True, probe_error=None, probe_work_writable=None, **kwargs):
         if state is None:
             state = {"session_id": "s1", "tab_id": 7, "task_base": self.task_base}
 
         def fake_probe(*args, **call_kwargs):
             if probe_error:
                 raise sn.Bridge(probe_error)
+            detail = call_kwargs.get("detail")
+            if detail is not None and probe_work_writable is not None:
+                detail["work_writable"] = probe_work_writable
             return probe
 
         with patch.object(sn, "_bsk_version", return_value="bsk 0.3.3"), \
@@ -549,6 +606,13 @@ class LayeredDiagnosticsTests(unittest.TestCase):
         self.assertEqual(statuses["tab"], "ok")
         self.assertEqual(statuses["jupyter"], "failed")
         self.assertIn("登录", info["next_action"])
+
+    def test_read_only_work_is_reported_at_the_jupyter_layer(self):
+        info = self._deep(probe_work_writable=False)
+        layers = {layer["layer"]: layer for layer in info["layers"]}
+        self.assertEqual(layers["jupyter"]["status"], "ok")
+        self.assertIs(layers["jupyter"]["detail"]["work_writable"], False)
+        self.assertIn("只读", layers["jupyter"]["action"])
 
     def test_reaped_session_is_stale_but_not_a_failure(self):
         info = self._deep(sessions=(), state={"session_id": "old", "tab_id": None,
@@ -664,8 +728,17 @@ class BoundedInspectionTests(unittest.TestCase):
              patch.object(sn, "inspect_text", return_value={"format": "text"}) as text:
             self.assertEqual(sn.inspect("work/a.ipynb"), {"format": "ipynb"})
             self.assertEqual(sn.inspect("work/a.py"), {"format": "text"})
+            self.assertEqual(sn.inspect("work/a.txt"), {"format": "text"})
         notebook.assert_called_once_with("work/a.ipynb")
-        text.assert_called_once_with("work/a.py")
+        self.assertEqual(text.call_count, 2)
+
+    def test_inspect_routes_csv_and_tsv_through_the_table_reader(self):
+        response = {"data": {"stdout": 'INSPECT_JSON={"format":"table"}'}}
+        with patch.object(sn, "run_python", return_value=response) as run:
+            self.assertEqual(sn.inspect("work/a.csv"), {"format": "table"})
+            self.assertEqual(sn.inspect("work/a.tsv"), {"format": "table"})
+        self.assertIn("sep=','", run.call_args_list[0].args[0])
+        self.assertIn("sep='\\t'", run.call_args_list[1].args[0])
 
 
 class KernelLifecycleTests(unittest.TestCase):
@@ -926,6 +999,11 @@ class BoundedStructuredInspectorsTests(unittest.TestCase):
         self.assertIn("bounded_summary_too_large", sn.RDS_R)
         self.assertIn('INSPECT_JSON=', sn.RDS_R)
 
+    def test_table_inspection_does_not_read_the_whole_file(self):
+        """Counting newlines scanned every byte; a multi-GB CSV timed out for it."""
+        self.assertNotIn("fh.read(", sn.TABLE)
+        self.assertIn("getsize", sn.TABLE)
+
 
 class BoundedPollProtocolTests(unittest.TestCase):
     def test_poll_uses_byte_caps_base64_and_a_per_call_frame(self):
@@ -998,8 +1076,8 @@ class PublicReleaseSafetyTests(unittest.TestCase):
             make_uuid.return_value.hex = "fixed"
             result = sn.write_text("work/out.txt", "hello")
         code = evaluate.call_args.args[1]["code"]
-        self.assertIn("os.O_EXCL", code)
-        self.assertIn("os.O_NOFOLLOW", code)
+        self.assertIn("tempfile.mkstemp", code)
+        self.assertIn("os.link(_temp, _path)", code)
         self.assertIn("os.fchmod(_fd, 0o600)", code)
         self.assertIn("write_readback_mismatch", code)
         self.assertEqual(result["data"], payload)
@@ -1069,6 +1147,23 @@ class PublicReleaseSafetyTests(unittest.TestCase):
         self.assertGreater(len(expressions), 2)
         self.assertTrue(all(len(item) <= sn.MAX_EXPR_CHARS for item in expressions))
 
+    def test_chunked_transfer_buffers_in_an_array_not_a_growing_string(self):
+        expressions = []
+
+        def fake_eval(tab_id, expression, timeout=60, session_id=None):
+            expressions.append(expression)
+            return {"ok": True, "data": {}}
+
+        payload = {"code": "x" * (sn.MAX_EXPR_CHARS * 2)}
+        with patch.object(sn, "_eval_js", side_effect=fake_eval):
+            sn._call_js("run_python", payload, 1, 60)
+        chunks = [item for item in expressions
+                  if item.startswith("window.__snPayload_") and ".push(" in item]
+        self.assertTrue(chunks, "chunks must be pushed onto an array")
+        self.assertTrue(all("+=" not in item for item in chunks),
+                        "repeated += on one string is O(n^2)")
+        self.assertIn(".join('')", expressions[-1])
+
     def test_small_payloads_use_a_single_evaluate_call(self):
         with patch.object(sn, "_eval_js", return_value={"ok": True}) as evaluate:
             sn._call_js("probe", {}, 1, 60)
@@ -1080,7 +1175,7 @@ class PublicReleaseSafetyTests(unittest.TestCase):
              patch.object(sn, "save_url") as save, patch.object(sn, "_print"), \
              patch.object(sn, "_browser_state", return_value={"session_id": "s1"}):
             self.assertEqual(sn.main(["connect", "--url", url]), 0)
-        ensure.assert_called_once_with(force=True, full_probe=True)
+        ensure.assert_called_once_with(full_probe=True)
         save.assert_called_once_with(url)
 
     def test_failed_connect_does_not_save_url(self):
@@ -1157,6 +1252,13 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertIn("## " + sn.CONTROLLER_VERSION, changelog)
         self.assertFalse((root / "config.json").exists())
         self.assertTrue((root / "config.example.json").exists())
+
+    def test_runtime_cache_key_matches_the_controller_version(self):
+        """A stale key makes reinjection of newer code a silent no-op."""
+        runtime = (Path(sn.SKILL_DIR) / "scripts" / "jupyter_runtime.js").read_text(encoding="utf-8")
+        match = re.search(r'var runtimeKey = "([^"]*):"', runtime)
+        self.assertIsNotNone(match, "runtimeKey must be declared as '<version>:' + base")
+        self.assertEqual(match.group(1), sn.CONTROLLER_VERSION)
 
     def test_skill_frontmatter_uses_only_official_fields_and_codex_is_explicit(self):
         root = Path(sn.SKILL_DIR)
@@ -1257,6 +1359,50 @@ class ConnectionRecoveryTests(unittest.TestCase):
         self.assertFalse(any(c["args"][0] == "navigate" for c in calls))
         save.assert_called_with(tab_id=2)
 
+    def test_saved_tab_is_preferred_when_the_session_has_two_matching_tabs(self):
+        tabs = [{'tab_id': 3, 'url': self.inner, 'scope': 'agent'},
+                {'tab_id': 2, 'url': self.inner, 'scope': 'agent'}]
+        with patch.object(sn, 'WORKSPACE_URL', self.url), \
+             patch.object(sn, '_browser_state', return_value={
+                 'session_id': 's1', 'tab_id': 2, 'task_base': self.task_base,
+                 'project_id': 'p', 'workspace_id': 'w'}), \
+             patch.object(sn, 'ensure_session', return_value='s1'), \
+             patch.object(sn, '_agent_tabs', return_value=tabs), \
+             patch.object(sn, '_probe_tab', return_value=True), \
+             patch.object(sn, '_save_browser_state'), patch.object(sn, 'bsk') as bsk_call:
+            self.assertEqual(sn.ensure_tab(), 2)
+        bsk_call.assert_not_called()
+
+    def test_failed_probe_keeps_the_existing_page_instead_of_reloading(self):
+        for failure in (False, sn.Bridge('temporary browser error')):
+            with self.subTest(failure=failure), \
+                 patch.object(sn, 'WORKSPACE_URL', self.url), \
+                 patch.object(sn, '_browser_state', return_value={
+                     'session_id': 's1', 'tab_id': 2, 'task_base': self.task_base,
+                     'project_id': 'p', 'workspace_id': 'w'}), \
+                 patch.object(sn, 'ensure_session', return_value='s1'), \
+                 patch.object(sn, '_agent_tabs', return_value=[{'tab_id': 2, 'url': self.inner}]), \
+                 patch.object(sn, '_probe_tab', **({'side_effect': failure} if isinstance(failure, Exception) else {'return_value': failure})), \
+                 patch.object(sn, 'bsk') as bsk_call:
+                with self.assertRaisesRegex(sn.Bridge, 'kept_open'):
+                    sn.ensure_tab()
+                bsk_call.assert_not_called()
+
+    def test_unverified_session_list_never_creates_a_replacement_session(self):
+        for response in (sn.Bridge('temporary daemon error'), {'unexpected': 'shape'},
+                         ['unexpected'], [{}], [{'session_id': None}]):
+            def fake(*args, **kwargs):
+                self.assertEqual(args, ('session', 'list'))
+                if isinstance(response, Exception):
+                    raise response
+                return response
+            with self.subTest(response=response), \
+                 patch.object(sn, '_browser_state', return_value={'session_id': 's1'}), \
+                 patch.object(sn, 'bsk', side_effect=fake) as bsk_call:
+                with self.assertRaises(sn.Bridge):
+                    sn.ensure_session()
+                self.assertEqual(bsk_call.call_count, 1)
+
     def test_missing_session_opens_the_workspace_then_the_jupyter_page(self):
         calls = []
         with patch.object(sn, "WORKSPACE_URL", self.url), \
@@ -1356,7 +1502,7 @@ class ConnectionRecoveryTests(unittest.TestCase):
         self.assertEqual(sum(c["args"][0] == "navigate" for c in calls), 1)
         probe.assert_not_called()
 
-    def test_navigation_race_is_retried_three_times(self):
+    def test_navigation_race_is_reported_without_replaying_an_expression(self):
         def fake(*args, **kwargs):
             if args[:2] == ("session", "list"):
                 return [{"session_id": "s1"}]
@@ -1365,7 +1511,7 @@ class ConnectionRecoveryTests(unittest.TestCase):
         with patch.object(sn, "_browser_state", return_value={"session_id": "s1"}),              patch.object(sn, "bsk", side_effect=fake) as call,              patch.object(sn.time, "sleep"):
             with self.assertRaisesRegex(sn.Bridge, "navigated or closed"):
                 sn._eval_js(2, "1")
-        self.assertEqual(call.call_count, 4)  # 1 session check + 3 attempts
+        self.assertEqual(call.call_count, 2)  # 1 session check + 1 dispatch
 
     def test_close_tolerates_a_session_the_daemon_already_dropped(self):
         with patch.object(sn, "_browser_state", return_value={"session_id": "gone"}),              patch.object(sn, "bsk", side_effect=sn.Bridge("bsk_not_found(session): nope")),              patch.object(sn, "_save_browser_state") as save:

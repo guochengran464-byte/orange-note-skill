@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Orange Note browser-backed agent operations, v4.1.0.
+"""Orange Note browser-backed agent operations, v4.1.4.
 Provides file inspection/transfer, bounded execution and persistent jobs through
 the built-in Jupyter workspace connector. Browser credentials stay in the page.
 The existing sn.py filename and runtime configuration remain compatible.
@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.dirname(HERE)
 RUNTIME_JS_PATH = os.path.join(HERE, "jupyter_runtime.js")
-CONTROLLER_VERSION = "4.1.0"
+CONTROLLER_VERSION = "4.1.4"
 LOGICAL_SESSION_ID = None
 _ACTIVE_BROWSER_SESSION = None
 
@@ -186,9 +186,7 @@ MAX_LOG_BYTES = 64 * 1024
 MAX_STATUS_BYTES = 4096
 MAX_INSPECT_BYTES = 1024 * 1024
 MAX_INSPECT_RESULT_BYTES = 48 * 1024
-MAX_INSPECT_ITEMS = 200
 MAX_INSPECT_VALUE_CHARS = 256
-MAX_NOTEBOOK_CELLS = 200
 MAX_SHELL_BYTES = 64 * 1024
 MAX_INTERNAL_SHELL_BYTES = 192 * 1024
 MAX_KERNEL_STREAM_CHARS = 640 * 1024
@@ -306,30 +304,27 @@ def validate_job_id(value):
     return value
 
 
+def _validate_bounded_int(value, low, high, error):
+    """Parse a decimal integer within [low, high], rejecting bools and loose forms."""
+    if isinstance(value, bool):
+        raise ValueError(error)
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(error) from exc
+    if not low <= number <= high or str(value).strip() != str(number):
+        raise ValueError(error)
+    return number
+
+
 def validate_tail(value):
     """Return a bounded log-tail line count or raise ValueError."""
-    if isinstance(value, bool):
-        raise ValueError("invalid_tail")
-    try:
-        tail = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("invalid_tail") from exc
-    if not 1 <= tail <= MAX_LOG_TAIL or str(value).strip() != str(tail):
-        raise ValueError("invalid_tail")
-    return tail
+    return _validate_bounded_int(value, 1, MAX_LOG_TAIL, "invalid_tail")
 
 
 def validate_inspect_bytes(value):
     """Return a bounded server-side inspection byte limit or raise ValueError."""
-    if isinstance(value, bool):
-        raise ValueError("invalid_inspect_bytes")
-    try:
-        limit = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("invalid_inspect_bytes") from exc
-    if not 1 <= limit <= MAX_INSPECT_BYTES or str(value).strip() != str(limit):
-        raise ValueError("invalid_inspect_bytes")
-    return limit
+    return _validate_bounded_int(value, 1, MAX_INSPECT_BYTES, "invalid_inspect_bytes")
 
 
 def validate_text_payload(value, max_bytes, error):
@@ -652,17 +647,16 @@ def bsk(*args, timeout=120, session=None, tab_id=None):
 
 
 def _session_ids():
-    try:
-        listed = bsk("session", "list", timeout=30)
-    except Bridge:
-        return set()
-    if not isinstance(listed, list):
-        return set()
-    return {item.get("session_id") for item in listed if isinstance(item, dict)}
+    listed = bsk("session", "list", timeout=30)
+    if not isinstance(listed, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("session_id"), str)
+            or not item["session_id"] for item in listed):
+        raise Bridge("bsk_session_list_invalid: existing sessions could not be verified")
+    return {item["session_id"] for item in listed}
 
 
 def ensure_session(force=False):
-    """Reuse the recorded bsk session, else start one (bsk reaps idle sessions)."""
+    """Reuse the recorded session; create only after verified absence."""
     global _ACTIVE_BROWSER_SESSION
     if LOGICAL_SESSION_ID and _ACTIVE_BROWSER_SESSION and not force:
         return _ACTIVE_BROWSER_SESSION
@@ -691,17 +685,9 @@ def _eval_js(tab_id, expression, timeout=60, session_id=None):
     """Evaluate one expression in the tab's main frame; returns the JSON value."""
     session_id = session_id or ensure_session()
     budget = min(max(1, timeout), 60)
-    for attempt in range(3):
-        try:
-            reply = bsk("evaluate", expression, "--timeout", f"{budget}s",
-                        timeout=budget + 20, session=session_id, tab_id=tab_id)
-            break
-        except Bridge as exc:
-            # CDP reports this when the tab navigated mid-call: the expression never ran,
-            # so retrying cannot duplicate a side effect. Not a general timeout retry.
-            if "inspected target navigated or closed" not in str(exc).lower() or attempt == 2:
-                raise
-            time.sleep(1)
+    # A lost browser response cannot prove that an expression had no side effects.
+    reply = bsk("evaluate", expression, "--timeout", f"{budget}s",
+                timeout=budget + 20, session=session_id, tab_id=tab_id)
     if reply.get("ok") is not True:
         error = reply.get("error") or {}
         text = error.get("text") if isinstance(error, dict) else None
@@ -726,11 +712,13 @@ def _call_js(op, payload, tab_id, timeout, session_id=None):
     _eval_js(tab_id, _runtime(), timeout, session_id)
     blob = json.dumps(payload)
     buffer = "window.__snPayload_" + uuid.uuid4().hex
-    _eval_js(tab_id, buffer + " = ''", timeout, session_id)
+    # Push chunks onto an array and join once: repeated `str += chunk` is O(n^2) and
+    # dominates transfer time for multi-MiB payloads (measured 3.4x slower at 3.2 MiB).
+    _eval_js(tab_id, buffer + " = []", timeout, session_id)
     for offset in range(0, len(blob), MAX_CHUNK_CHARS):
-        _eval_js(tab_id, buffer + " += " + json.dumps(blob[offset:offset + MAX_CHUNK_CHARS]),
+        _eval_js(tab_id, buffer + ".push(" + json.dumps(blob[offset:offset + MAX_CHUNK_CHARS]) + ")",
                  timeout, session_id)
-    expression = ("(async () => { const p = JSON.parse(%s); delete %s;"
+    expression = ("(async () => { const p = JSON.parse(%s.join('')); %s.length = 0;"
                   " return await window.__codexJupyter(%s, p); })()"
                   % (buffer, buffer, json.dumps(op)))
     return _eval_js(tab_id, expression, timeout, session_id)
@@ -741,10 +729,12 @@ def _task_base(iframe_src):
     return match.group(1) if match else None
 
 
-def _probe_tab(tab_id, lite=True):
+def _probe_tab(tab_id, lite=True, detail=None):
     """Read-only readiness probe. `lite` skips root/work/session enumeration."""
     result = _call_js("probe", {"lite": bool(lite)}, tab_id, 30) or {}
     data = result.get("data") or {}
+    if detail is not None:
+        detail.update(data)
     statuses = [data.get(key) for key in ("status_code", "root_status", "work_status")]
     if any(status in (401, 403) for status in statuses):
         raise Bridge("jupyter_auth_required: Jupyter 登录或访问权限失效，请在 Edge 中检查登录状态")
@@ -766,18 +756,21 @@ def ensure_tab(force=False, full_probe=False, settle=60):
 
     if (not force and task_base and state.get("project_id") == project_id
             and state.get("workspace_id") == workspace_id):
-        match = next((t for t in tabs
-                      if str(t.get("url", "")).startswith(INNER_ORIGIN + task_base)), None)
+        matches = [t for t in tabs if str(t.get("url", "")).startswith(INNER_ORIGIN + task_base)]
+        match = next((t for t in matches if t.get("tab_id") == state.get("tab_id")),
+                     matches[0] if matches else None)
         if match and match.get("tab_id") is not None:
             tab_id = match["tab_id"]
             try:
-                if _probe_tab(tab_id, lite=not full_probe):
-                    _save_browser_state(tab_id=tab_id)
-                    return tab_id
+                ready = _probe_tab(tab_id, lite=not full_probe)
             except Bridge as exc:
                 if str(exc).startswith("jupyter_auth_required:"):
                     raise
-                # Tab exists but is not answering; fall through and reload the workspace.
+                raise Bridge(f"workspace_probe_failed_kept_open: tab_id={tab_id}; {exc}") from exc
+            if not ready:
+                raise Bridge(f"jupyter_unavailable_kept_open: tab_id={tab_id}; retry the probe when the workspace is ready")
+            _save_browser_state(tab_id=tab_id)
+            return tab_id
 
     tab_id = tabs[0].get("tab_id") if tabs else None
     nav = bsk("navigate", target_url, session=session_id, timeout=120, tab_id=tab_id)
@@ -871,11 +864,6 @@ print({marker!r} + _encoded)
 """
 
 
-def _between(t, a, b):
-    i, j = t.find(a), t.find(b)
-    return t[i + len(a):j] if (i >= 0 and j >= i) else ""
-
-
 def run_shell(cmd, cwd=None, timeout=MAX_SYNC_SECONDS, max_bytes=MAX_SHELL_BYTES):
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or not 1 <= max_bytes <= MAX_INTERNAL_SHELL_BYTES:
         raise ValueError("invalid_shell_output_limit")
@@ -934,43 +922,37 @@ def _write_bytes(path, raw, overwrite, root):
         raise ValueError("write_path_must_be_under_work_root")
     encoded = base64.b64encode(raw).decode("ascii")
     marker = f"__SN_WRITE_{uuid.uuid4().hex}__:"
-    code = f'''import base64, json, os, stat
+    code = f'''import base64, json, os, stat, tempfile
 _path = {server_path!r}
 _root = {root!r}
 _data = base64.b64decode({encoded!r}, validate=True)
 _overwrite = {bool(overwrite)!r}
 _out = None
+_temp = None
 try:
     _parent = os.path.dirname(_path)
-    os.makedirs(_parent, mode=0o700, exist_ok=True)
     if os.path.commonpath((os.path.realpath(_root), os.path.realpath(_parent))) != os.path.realpath(_root):
         raise ValueError('write_parent_outside_work_root')
+    os.makedirs(_parent, mode=0o700, exist_ok=True)
     _existed = os.path.lexists(_path)
+    if _existed and not _overwrite:
+        raise FileExistsError(_path)
     if _overwrite and _existed:
         _before = os.lstat(_path)
         if not stat.S_ISREG(_before.st_mode):
             raise ValueError('target_not_regular_file')
-    _flags = os.O_WRONLY | os.O_CREAT
-    _flags |= os.O_TRUNC if _overwrite else os.O_EXCL
-    if hasattr(os, 'O_NOFOLLOW'): _flags |= os.O_NOFOLLOW
-    if hasattr(os, 'O_CLOEXEC'): _flags |= os.O_CLOEXEC
-    _fd = os.open(_path, _flags, 0o600)
+    _fd, _temp = tempfile.mkstemp(prefix='.sn-write-', dir=_parent)
     try:
         if not stat.S_ISREG(os.fstat(_fd).st_mode):
             raise ValueError('target_not_regular_file')
         os.fchmod(_fd, 0o600)
         _offset = 0
         while _offset < len(_data):
-            _offset += os.write(_fd, _data[_offset:])
+            _written = os.write(_fd, _data[_offset:])
+            if _written <= 0: raise OSError('write_made_no_progress')
+            _offset += _written
         os.fsync(_fd)
-    finally:
-        os.close(_fd)
-    _read_flags = os.O_RDONLY
-    if hasattr(os, 'O_NOFOLLOW'): _read_flags |= os.O_NOFOLLOW
-    _fd = os.open(_path, _read_flags)
-    try:
-        if not stat.S_ISREG(os.fstat(_fd).st_mode):
-            raise ValueError('target_not_regular_file')
+        os.lseek(_fd, 0, os.SEEK_SET)
         _readback = b''
         while len(_readback) <= len(_data):
             _chunk = os.read(_fd, min(1048576, len(_data) + 1 - len(_readback)))
@@ -980,12 +962,24 @@ try:
         os.close(_fd)
     if _readback != _data:
         raise ValueError('write_readback_mismatch')
+    _existed = os.path.lexists(_path)
+    if _overwrite:
+        if _existed and not stat.S_ISREG(os.lstat(_path).st_mode):
+            raise ValueError('target_not_regular_file')
+        os.replace(_temp, _path)
+        _temp = None
+    else:
+        os.link(_temp, _path)
     _out = {{'ok': True, 'path': _path, 'bytes': len(_data),
              'overwritten': bool(_overwrite and _existed)}}
 except FileExistsError:
     _out = {{'ok': False, 'error': 'file_exists_use_overwrite', 'path': _path}}
 except Exception as _exc:
     _out = {{'ok': False, 'error': str(_exc)[:256], 'path': _path}}
+finally:
+    if _temp is not None:
+        try: os.unlink(_temp)
+        except OSError: pass
 print({marker!r} + base64.b64encode(json.dumps(_out, sort_keys=True).encode('utf-8')).decode('ascii'))
 '''
     result = evaluate_op("run_python", {"code": code, "timeout_ms": MAX_SYNC_SECONDS * 1000},
@@ -1548,6 +1542,121 @@ def accept_job(job_id, note=None):
             "acceptance_note": record.get("acceptance_note", "")}
 
 
+_PRUNE_JOBS = r'''
+import datetime, json, os, re, shutil, stat, time
+root = %(root)r
+cutoff = time.time() - %(days)d * 86400
+dry_run = %(dry)r
+job_pattern = re.compile(%(job_pattern)r)
+result = {'ok': True, 'removed': 0, 'eligible': 0, 'skipped': 0,
+          'freed_bytes': None, 'job_ids': [], 'job_ids_truncated': False, 'errors': []}
+
+def read_regular(path, limit):
+    if not stat.S_ISREG(os.lstat(path).st_mode):
+        raise ValueError('not_regular_file')
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError('not_regular_file')
+        value = os.read(fd, limit + 1)
+        if len(value) > limit:
+            raise ValueError('record_too_large')
+        return value.decode('utf-8')
+    finally:
+        os.close(fd)
+
+def eligible(path, name):
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or not job_pattern.fullmatch(name):
+        return None
+    if os.path.dirname(os.path.realpath(path)) != os.path.realpath(root):
+        return None
+    status = json.loads(read_regular(os.path.join(path, 'status.json'), 4096))
+    manifest = json.loads(read_regular(os.path.join(path, 'manifest.json'), 512 * 1024))
+    if (not isinstance(status, dict) or not isinstance(manifest, dict) or
+            status.get('job_id') != name or manifest.get('job_id') != name or
+            status.get('state') != 'finished'):
+        return None
+    ended = datetime.datetime.strptime(status['ended_at'], '%%Y-%%m-%%dT%%H:%%M:%%SZ')
+    if ended.replace(tzinfo=datetime.timezone.utc).timestamp() >= cutoff:
+        return None
+    pid = int(read_regular(os.path.join(path, 'pid'), 32).strip())
+    if pid <= 1:
+        return None
+    # A dead runner can leave live children in its process group.
+    for check in (os.kill, getattr(os, 'killpg', os.kill)):
+        try:
+            check(pid, 0)
+            return None
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return None
+    return info.st_dev, info.st_ino
+
+try:
+    if not stat.S_ISDIR(os.lstat(root).st_mode):
+        raise ValueError('unsafe_root')
+    with os.scandir(root) as entries:
+        for entry in entries:
+            try:
+                identity = eligible(entry.path, entry.name)
+            except (OSError, ValueError, KeyError, TypeError, OverflowError):
+                identity = None
+            if identity is None:
+                result['skipped'] += 1
+                continue
+            result['eligible'] += 1
+            if len(result['job_ids']) < 100:
+                result['job_ids'].append(entry.name)
+            else:
+                result['job_ids_truncated'] = True
+            if not dry_run:
+                try:
+                    if eligible(entry.path, entry.name) != identity:
+                        result['skipped'] += 1
+                        continue
+                    shutil.rmtree(entry.path)
+                    result['removed'] += 1
+                except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
+                    result['ok'] = False
+                    result['error'] = 'prune_partial_failure'
+                    if len(result['errors']) < 20:
+                        result['errors'].append({'job_id': entry.name, 'error': str(exc)[:256]})
+    result['remaining'] = sum(1 for entry in os.scandir(root) if entry.is_dir(follow_symlinks=False))
+except (OSError, ValueError) as exc:
+    result.update(ok=False, error='prune_scan_failed', detail=str(exc)[:256])
+print('PRUNE_JSON=' + json.dumps(result, separators=(',', ':')))
+'''
+
+
+def prune_jobs(days=7, dry_run=False):
+    """Delete finished job directories older than `days`, never a live owner."""
+    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 3650:
+        raise ValueError("invalid_days: use 1-3650")
+    code = _PRUNE_JOBS % {"root": JOB_ROOT, "days": days, "dry": bool(dry_run),
+                          "job_pattern": _JOB_ID_RE.pattern}
+    cmd = "python3 -c " + shlex.quote(code)
+    res = run_shell(cmd, cwd=WORK_ROOT, timeout=MAX_SYNC_SECONDS,
+                    max_bytes=MAX_INTERNAL_SHELL_BYTES)
+    out = str(res.get("stdout") or "")
+    line = next((item for item in out.splitlines() if item.startswith("PRUNE_JSON=")), None)
+    if res.get("timedOut"):
+        return {"ok": False, "error": "prune_timeout",
+                "detail": f"operation exceeded {MAX_SYNC_SECONDS}s; deletion may be partial; inspect jobs before retrying"}
+    if line is None or res.get("ok") is not True or res.get("returncode") != 0:
+        return {"ok": False, "error": "prune_protocol_error",
+                "stderr": (res.get("stderr") or "")[:MAX_INSPECT_VALUE_CHARS]}
+    try:
+        result = json.loads(line[len("PRUNE_JSON="):])
+    except ValueError:
+        return {"ok": False, "error": "prune_protocol_error"}
+    if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+        return {"ok": False, "error": "prune_protocol_error"}
+    result.update(days=days, dry_run=bool(dry_run), root=JOB_ROOT)
+    return result
+
+
 _ARTIFACT_INVENTORY = r'''
 import hashlib, json, os, stat
 MAX_RESULT_BYTES = __MAX_RESULT_BYTES__
@@ -1681,15 +1790,14 @@ TABLE = _INSPECT_PRELUDE + r'''
 import pandas as pd, json
 p=safe_path(%(p)r); sep=%(sep)r
 df=pd.read_csv(p, sep=sep, nrows=1000)
-try:
-    with open(p, "rb") as fh:
-        total=sum(block.count(b"\n") for block in iter(lambda: fh.read(1048576), b""))
-except Exception: total=None
+# File size comes from stat: counting newlines meant reading the whole file, which
+# timed out on multi-GB CSV for a field nothing consumed.
+size_bytes=os.path.getsize(p)
 selected=list(itertools.islice(df.columns, MAX_ITEMS))
 rows=[]
 for record in df.loc[:, selected].head(5).to_dict(orient="records"):
     rows.append({clip(k): clip(v) for k, v in itertools.islice(record.items(), MAX_ITEMS)})
-out={"format":"table","path":p,"sampled_rows":int(len(df)),"total_lines":total,
+out={"format":"table","path":p,"sampled_rows":int(len(df)),"size_bytes":size_bytes,
  "n_columns":int(df.shape[1]),"columns":{clip(c):clip(df[c].dtype) for c in selected},
  "head":rows[:MAX_CELLS]}
 emit_summary(out)
@@ -1824,30 +1932,16 @@ def inspect(path, timeout=300):
     ext = os.path.splitext(raw.split("?")[0])[1].lower()
     srv = to_server(raw)
 
-    if ext == ".h5ad":
-        r = run_python(H5AD % {"p": srv}, timeout=min(timeout, MAX_SYNC_SECONDS))
-        data = r.get("data", {}) or {}
-        out = _pull_json(data.get("stdout"))
-        return out or {"error": "inspect_failed",
-                       "stderr": str(data.get("stderr") or "")[:MAX_INSPECT_VALUE_CHARS],
-                       "raw": str(data.get("stdout") or "")[:MAX_INSPECT_VALUE_CHARS]}
-
-    if ext in (".csv", ".tsv", ".txt"):
-        sep = "\t" if ext == ".tsv" else ","
-        r = run_python(TABLE % {"p": srv, "sep": sep}, timeout=min(timeout, MAX_SYNC_SECONDS))
-        data = r.get("data", {}) or {}
-        out = _pull_json(data.get("stdout"))
-        return out or {"error": "inspect_failed",
-                       "stderr": str(data.get("stderr") or "")[:MAX_INSPECT_VALUE_CHARS],
-                       "raw": str(data.get("stdout") or "")[:MAX_INSPECT_VALUE_CHARS]}
-
-    if ext == ".parquet":
-        r = run_python(PARQUET % {"p": srv}, timeout=min(timeout, MAX_SYNC_SECONDS))
-        data = r.get("data", {}) or {}
-        out = _pull_json(data.get("stdout"))
-        return out or {"error": "inspect_failed",
-                       "stderr": str(data.get("stderr") or "")[:MAX_INSPECT_VALUE_CHARS],
-                       "raw": str(data.get("stdout") or "")[:MAX_INSPECT_VALUE_CHARS]}
+    source, extra = {
+        ".h5ad": (H5AD, {}),
+        ".parquet": (PARQUET, {}),
+        ".csv": (TABLE, {"sep": ","}),
+        ".tsv": (TABLE, {"sep": "\t"}),
+    }.get(ext, (None, {}))
+    if source is not None:
+        return _bounded_inspection_result(
+            run_python(source % {"p": srv, **extra}, timeout=min(timeout, MAX_SYNC_SECONDS)),
+            srv, "inspect_failed")
 
     if ext == ".ipynb":
         return inspect_ipynb(raw)
@@ -1855,11 +1949,7 @@ def inspect(path, timeout=300):
     if ext in (".rds",):
         return inspect_rds(srv, timeout=timeout)
 
-    # scripts / text
-    if ext in (".py", ".r", ".sh", ".md", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini", ".log", ""):
-        return inspect_text(raw)
-
-    # default: peek as text
+    # scripts, text and unknown extensions all get the bounded text preview
     return inspect_text(raw)
 
 
@@ -1969,6 +2059,7 @@ def inspect_ipynb(path, max_bytes=DEFAULT_NOTEBOOK_SUMMARY_BYTES):
 def inspect_rds(srv_path, timeout=300):
     # Embed the description program in the durable launcher, then use its returned ID.
     cmd = f"Rscript -e {shlex.quote(RDS_R)} {shlex.quote(srv_path)}"
+    # Fresh jobs avoid stale results and collisions with pruned or other-session jobs.
     job = submit(cmd, name="rdsinspect")
     jid = job["job_id"]
     deadline = time.time() + timeout
@@ -2119,9 +2210,20 @@ def doctor(deep=False):
             add("jupyter", "skipped")
         else:
             try:
-                ready = _probe_tab(tab_id, lite=True)
-                add("jupyter", "ok" if ready else "failed", {"status_code": 200},
-                    None if ready else "工作区 Jupyter 未就绪；检查启动或队列状态")
+                # Full probe (not the routine lite one) so a read-only workspace is
+                # reported here instead of surfacing later as a write failure.
+                detail = {}
+                ready = _probe_tab(tab_id, lite=False, detail=detail)
+                writable = detail.get("work_writable")
+                shown = {"status_code": detail.get("status_code", 200 if ready else None)}
+                if writable is not None:
+                    shown["work_writable"] = writable
+                action = None
+                if not ready:
+                    action = "工作区 Jupyter 未就绪；检查启动或队列状态"
+                elif writable is False:
+                    action = "work 目录只读；write/put 会失败，请检查工作区权限"
+                add("jupyter", "ok" if ready else "failed", shown, action)
             except Bridge as exc:
                 message = str(exc)
                 if message.startswith("jupyter_auth_required:"):
@@ -2251,6 +2353,9 @@ def main(argv):
     p = sub.add_parser("jobs", help="job registry: server job dirs merged with local receipts")
     p.add_argument("--remote", action="store_true", help="also scan /data/work/agent_jobs")
     p.add_argument("--limit", type=int, default=20)
+    p = sub.add_parser("prune", help="delete finished job dirs older than N days (never a live owner)")
+    p.add_argument("--days", type=int, default=7, help="age threshold in days (default: 7)")
+    p.add_argument("--dry-run", action="store_true", help="report what would be removed")
     p = sub.add_parser("cancel", help="SIGTERM a job whose PID still belongs to its job directory")
     p.add_argument("job_id")
     p = sub.add_parser("accept", help="record that a job's result was accepted")
@@ -2260,7 +2365,7 @@ def main(argv):
     p = sub.add_parser("artifacts", help="inventory regular files under a job's artifacts directory")
     p.add_argument("job_id")
 
-    sub.add_parser("close", help="stop the controller bsk session (closes its Agent Window tab)")
+    sub.add_parser("close", help="only when requested: close this controller's browser page and owned kernel")
 
     a = ap.parse_args(argv)
     session_id = a.session
@@ -2292,7 +2397,7 @@ def _dispatch(a):
             supplied_url = canonical_workspace_url(a.url) if getattr(a, "url", None) else None
             if supplied_url:
                 set_runtime_url(supplied_url)
-            tab_id = ensure_tab(force=bool(supplied_url) and not LOGICAL_SESSION_ID, full_probe=True)
+            tab_id = ensure_tab(full_probe=True)
             if supplied_url:
                 save_url(supplied_url)
             state = _browser_state()
@@ -2331,6 +2436,8 @@ def _dispatch(a):
                           idempotency_key=a.idempotency_key))
         elif a.subcmd == "jobs":
             return _emit(list_jobs(limit=a.limit, remote=a.remote))
+        elif a.subcmd == "prune":
+            return _emit(prune_jobs(days=a.days, dry_run=a.dry_run))
         elif a.subcmd == "cancel":
             return _emit(cancel_job(a.job_id))
         elif a.subcmd == "accept":

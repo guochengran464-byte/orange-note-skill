@@ -1,5 +1,45 @@
 # Changelog
 
+## 4.1.4 — 2026-10-24
+
+### Session lifecycle
+
+- Reuse each agent's independent page and healthy kernel between operations;
+  completing a task no longer implies closing its page. Configure BrowserSkill
+  with `--session-idle 5m`: expire each session after about five idle minutes,
+  rather than imposing a five-minute total lifetime. Explicit release still
+  closes only the selected session. Reconnect with its saved logical ID on demand.
+- Repeated connect, including the same supplied URL, keeps the existing page.
+  Prefer its saved tab ID; failed probes or unverified session listings report
+  an error instead of refreshing a page or creating a duplicate session.
+
+### Reliability and data protection
+
+- Stage and verify text/binary writes before atomic publication or authorized
+  replacement, preserving existing files on write/readback failure.
+- Close each execution WebSocket while retaining healthy kernels and queues.
+  Ignore unrelated idle messages and recover after execution timeout/channel loss.
+- Report uncertain navigation errors without replaying executable expressions.
+- Read RDS input in a fresh job each time, avoiding stale path-only cached results
+  and conflicts with removed jobs or another session's inspection.
+- Add `prune --days N [--dry-run]`. Require exact job IDs, matching manifests,
+  verified old completion and absent PID/process groups; preserve unknown,
+  malformed, active and unverifiable records. Report deletion errors honestly.
+- Route `.txt` inspection through the bounded text reader. CSV/TSV inspection
+  uses file size instead of counting lines across the entire source.
+- Buffer upload chunks in an array and join once; keep runtime/cache versions
+  aligned. Reject ignored Range responses before reading an oversized body.
+- Include `work_writable` in deep diagnostics and expand behavioral regressions.
+
+### Compatibility notes
+
+- Skill identity, existing command names, session configuration and general
+  submission idempotency remain compatible; no Python dependency is added.
+- `prune` is workspace-wide and includes task logs/artifacts. `eligible` counts
+  candidates, `removed` counts actual deletions (zero for dry-run), and unmeasured
+  `freed_bytes` is `null`. Browser idle expiry does not cancel detached jobs or
+  guarantee that Jupyter has reclaimed remote kernels.
+
 ## 4.1.0 — 2026-10-22
 
 - Add `session create --url`, `session list` and explicit `--session ID` selection.
