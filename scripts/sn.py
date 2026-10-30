@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Orange Note browser-backed agent operations, v4.1.4.
+"""Orange Note browser-backed agent operations, v4.2.0.
 Provides file inspection/transfer, bounded execution and persistent jobs through
 the built-in Jupyter workspace connector. Browser credentials stay in the page.
 The existing sn.py filename and runtime configuration remain compatible.
@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.dirname(HERE)
 RUNTIME_JS_PATH = os.path.join(HERE, "jupyter_runtime.js")
-CONTROLLER_VERSION = "4.1.4"
+CONTROLLER_VERSION = "4.2.0"
 LOGICAL_SESSION_ID = None
 _ACTIVE_BROWSER_SESSION = None
 
@@ -615,7 +615,7 @@ def _save_browser_state(**updates):
     os.replace(tmp, path)
 
 
-def bsk(*args, timeout=120, session=None, tab_id=None):
+def _bsk_call(*args, timeout=120, session=None, tab_id=None):
     """Run one `bsk` CLI call and return its JSON payload."""
     if not os.path.exists(BSK_BIN):
         raise Bridge(f"bsk_missing: {BSK_BIN} — 需先安装 BrowserSkill CLI")
@@ -644,6 +644,37 @@ def bsk(*args, timeout=120, session=None, tab_id=None):
     if proc.returncode != 0:
         raise Bridge(f"bsk_failed({args[0]}): exit {proc.returncode}")
     return payload
+
+
+def bsk(*args, timeout=120, session=None, tab_id=None):
+    """Coordinate each browser action when using BrowserSkill 0.4 or newer."""
+    if args[0] in ("navigate", "evaluate") and session:
+        version = _bsk_version()
+        match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", version)
+        if not match:
+            raise Bridge("bsk_version_unknown: cannot determine browser coordination requirements")
+        if tuple(map(int, match.groups())) >= (0, 4, 0):
+            if tab_id is None:
+                raise Bridge("agent_tab_unverified: browser action requires a controller-owned tab")
+            if args[0] == "navigate":
+                listed = _bsk_call("tab", "list", timeout=30, session=session)
+                tabs = listed.get("tabs", []) if isinstance(listed, dict) else []
+                tab = next((t for t in tabs if t.get("tab_id") == tab_id and t.get("scope") == "agent"), None)
+                if tab is None:
+                    raise Bridge("agent_tab_unverified: navigation requires a controller-owned tab")
+                if tab.get("url") == "about:blank":
+                    return _bsk_call(*args, timeout=timeout, session=session, tab_id=tab_id)
+            sync = _bsk_call("cooperate", "sync", "--settle", timeout=30, session=session, tab_id=tab_id)
+            state = sync.get("state") or {} if isinstance(sync, dict) else {}
+            context = sync.get("context_id") if isinstance(sync, dict) else None
+            if state.get("mode") != "ready" or not isinstance(context, str) or not context:
+                raise Bridge("cooperation_not_ready: " + str(state.get("mode") or "unknown"))
+            args = (*args, "--context", context)
+    return _bsk_call(*args, timeout=timeout, session=session, tab_id=tab_id)
+
+
+def _is_cooperation_error(exc):
+    return str(exc).startswith("cooperation_") or "(cooperate)" in str(exc)
 
 
 def _session_ids():
@@ -786,7 +817,9 @@ def ensure_tab(force=False, full_probe=False, settle=60):
     while time.monotonic() < deadline:
         try:
             iframe_src = str(_eval_js(tab_id, IFRAME_SRC_JS, 30) or "")
-        except Bridge:
+        except Bridge as exc:
+            if _is_cooperation_error(exc):
+                raise
             iframe_src = ""
         if iframe_src:
             break
@@ -803,7 +836,7 @@ def ensure_tab(force=False, full_probe=False, settle=60):
             if _probe_tab(tab_id, lite=not full_probe):
                 break
         except Bridge as exc:
-            if str(exc).startswith("jupyter_auth_required:"):
+            if str(exc).startswith("jupyter_auth_required:") or _is_cooperation_error(exc):
                 raise
         if time.monotonic() >= probe_deadline:
             raise Bridge("jupyter_unavailable: 工作区 Jupyter 未就绪（api/status 非 200）")
@@ -1010,6 +1043,27 @@ def _transfer_path(remote):
     return server_path, contents
 
 
+def _resolved_link_stat(contents, expected_size):
+    """Verify a size discrepancy against the followed server-side symlink."""
+    server_path = posixpath.normpath("/data/" + contents.lstrip("/"))
+    if server_path != "/data" and not server_path.startswith("/data/"):
+        raise Bridge("remote_link_outside_contents_root")
+    code = ("import os, json\n"
+            f"p = {server_path!r}\n"
+            "a = os.lstat(p); b = os.stat(p)\n"
+            "print(json.dumps({'is_link': os.path.islink(p), 'size': b.st_size, "
+            "'fingerprint': [a.st_dev,a.st_ino,a.st_size,a.st_mtime_ns,a.st_ctime_ns,"
+            "b.st_dev,b.st_ino,b.st_size,b.st_mtime_ns,b.st_ctime_ns]}))")
+    result = run_python(code)
+    try:
+        data = json.loads((result.get("data") or {}).get("stdout") or "")
+    except (ValueError, TypeError) as exc:
+        raise Bridge("remote_link_stat_invalid") from exc
+    if data.get("is_link") is not True or data.get("size") != expected_size:
+        raise Bridge("remote_link_size_changed_or_unverified")
+    return {"size": expected_size, "last_modified": "resolved-link:" + json.dumps(data["fingerprint"])}
+
+
 def _remote_stat(contents, session_id=None, tab_id=None):
     value = _call_js("stat", {"path": contents}, tab_id or ensure_tab(), 30, session_id) or {}
     data = value.get("data") or {}
@@ -1020,6 +1074,9 @@ def _remote_stat(contents, session_id=None, tab_id=None):
     size = data.get("size")
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         raise Bridge("remote_size_unknown")
+    range_size = data.get("range_size")
+    if isinstance(range_size, int) and not isinstance(range_size, bool) and range_size != size:
+        return _resolved_link_stat(contents, range_size)
     return {"size": size, "last_modified": data.get("last_modified")}
 
 
@@ -2229,6 +2286,9 @@ def doctor(deep=False):
                 if message.startswith("jupyter_auth_required:"):
                     add("jupyter", "failed", {"error": message[:200]},
                         "在同一个浏览器 profile 中重新登录 DCS/Jupyter")
+                elif _is_cooperation_error(exc):
+                    add("jupyter", "failed", {"error": message[:200]},
+                        "检查 BrowserSkill cooperate 状态；保留当前页面，等待人工操作结束后再试")
                 else:
                     add("jupyter", "failed", {"error": message[:200]},
                         "运行 connect 重新打开工作区，仍失败则 bsk doctor")

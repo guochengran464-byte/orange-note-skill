@@ -1,6 +1,6 @@
-# v4.1.4 release checks
+# v4.2.0 release checks
 
-See `docs/VALIDATION_v4.1.4.md` for current scope. Historical live checks are
+See `docs/VALIDATION_v4.2.0.md` for current scope. Historical live checks are
 identified separately from local regressions and the configured idle timeout.
 - [x] Full Windows Python regression suite and added behavioral safety checks.
 - [x] Node syntax and runtime behavior checks, including repeated execution and recovery.

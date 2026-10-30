@@ -32,7 +32,7 @@
   var B = discoverBase();
   // Keep in sync with CONTROLLER_VERSION in sn.py. A stale value makes a reinjection
   // of newer code a silent no-op, because the guard below returns early.
-  var runtimeKey = "4.1.4:" + B.basePath;
+  var runtimeKey = "4.2.0:" + B.basePath;
   if (window.__snRuntimeKey === runtimeKey && window.__codexJupyter) return;
   var apiUrl = function (p) { return B.baseUrl + String(p).replace(/^\//, ""); };
   var wsBase = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + B.basePath;
@@ -259,8 +259,18 @@
     if (!r.ok) return { ok: false, status: r.status,
                         error: r.status === 404 ? "not_found" : "stat_failed" };
     var body = r.body || {};
+    var rangeSize = null;
+    if (body.type === "file") {
+      var file = await fetch(B.basePath + "files/" + encPath(path), {
+        credentials: "same-origin", cache: "no-store", headers: { Range: "bytes=0-0" }
+      });
+      var range = (file.status === 206 || file.status === 416) &&
+                  (file.headers.get("content-range") || "").match(/^bytes (?:0-0|\*)\/(\d+)$/i);
+      if (range && Number.isSafeInteger(Number(range[1]))) rangeSize = Number(range[1]);
+      if (file.body) await file.body.cancel();
+    }
     return { ok: true, status: r.status, type: body.type, size: body.size,
-             last_modified: body.last_modified };
+             last_modified: body.last_modified, range_size: rangeSize };
   }
 
   async function fetchRange(path, start, end) {

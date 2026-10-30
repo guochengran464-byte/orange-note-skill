@@ -7,7 +7,7 @@ description: >
   when the user requests Orange Note or authorizes operations in that workspace.
 ---
 
-# Orange Note — v4.1.4
+# Orange Note — v4.2.0
 
 Use the bundled CLI for repeatable Agent operations through BrowserSkill and the
 current user's browser login. The built-in connector accepts DCS StereoNote URLs;
@@ -33,6 +33,10 @@ other websites and self-hosted notebook servers need a matching connector.
 Use Windows Python, an already logged-in Edge/Chrome profile, BrowserSkill CLI,
 and its connected extension. Operate only controller-owned Agent Window tabs.
 Keep the CLI, runtime JavaScript, metadata and documents together when installing.
+BrowserSkill 0.4 uses a fresh shared-control context for each navigation or
+evaluation; the controller handles this automatically. A coordination refusal
+is not permission to replay an operation or refresh an existing page. Wait for
+the human to finish, inspect the current state, then retry only if safe.
 
 ## Session lifetime
 
@@ -84,6 +88,10 @@ previews and external mounts use bounded kernel helpers.
 - Downloads use 256 KiB chunks and workspace-bound `.part` metadata. Source changes
   invalidate resume. Default remote SHA-256 covers files up to 64 MiB; larger files
   report `size_only`. Uploads are limited to 4 MiB.
+- Where a server exposes the target size through HTTP Content-Range and it differs
+  from Contents metadata, symbolic-link downloads verify the target via the
+  controller-owned kernel. A server that hides the range total cannot be assumed
+  to provide this correction; checksum errors must not be treated as success.
 - Synchronous Python/shell execution is limited to 50 seconds. Submit longer work.
 - Preserve bounded output and explicit truncation. Inspect metadata before loading
   large scientific objects; `inspect` summarizes supported formats without transferring matrices.
@@ -148,4 +156,4 @@ only to the saved target or a newly supplied URL. Installation, destructive
 changes, permission expansion and process termination follow user authorization.
 
 For installation, support limits and verified scenarios, read `README.md`,
-`COMPATIBILITY.md`, `SECURITY.md` and `docs/VALIDATION_v4.1.4.md` as needed.
+`COMPATIBILITY.md`, `SECURITY.md` and `docs/VALIDATION_v4.2.0.md` as needed.

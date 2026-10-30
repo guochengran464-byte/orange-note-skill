@@ -1,7 +1,8 @@
 # Compatibility
 
-v4.1.4 keeps independent conversation pages within a five-minute idle window.
-Its current validation scope is recorded in `docs/VALIDATION_v4.1.4.md`.
+v4.2.0 supports BrowserSkill 0.4 shared control and keeps independent conversation
+pages within a five-minute idle window. Its current validation scope is recorded
+in `docs/VALIDATION_v4.2.0.md`.
 The three-agent results below describe the earlier v4.1.0 release.
 
 Orange Note provides a reusable Agent operation interface, with a built-in
@@ -14,9 +15,16 @@ self-hosted Jupyter servers require a connector adaptation.
 | Windows native Python controller | Tested |
 | Edge with BrowserSkill | Tested |
 | BrowserSkill CLI 0.3.2 / Edge extension 0.3.3 | Used for live verification |
+| BrowserSkill CLI / daemon / Edge extension 0.4.0 | Live connection and independent sessions tested in v4.2.0 |
 | Linux workspace with Jupyter REST/WebSocket APIs | Tested through the built-in connector |
 | macOS/Linux/WSL as the local controller | Unverified |
 | Other browser profiles, new CLI/extension versions | Re-run the smoke checks before relying on them |
+
+For symbolic-link downloads, size discrepancy detection requires a server that
+reports the target size in `Content-Range`. When that size differs from Contents
+metadata, a controller-owned kernel verifies the link and target fingerprint.
+Servers without that range metadata are not validated for this case. Normal
+downloads remain bounded; ignored ranges are never buffered as whole files.
 
 The connector uses `bsk session`, `tab`, `navigate` and main-frame `evaluate`.
 Browser state and sessions are isolated by workspace. A controller-owned Jupyter

@@ -115,6 +115,31 @@ test('partial responses and complete small files retain binary download support'
   }
 });
 
+test('stat detects a Contents size mismatch using a bounded range response', async () => {
+  const p = page();
+  let cancelled = 0;
+  p.context.fetch = async (url) => url.includes('api/contents/')
+    ? {ok:true,status:200,headers:{get:()=> 'application/json'},json:async()=>({type:'file',size:10,last_modified:'link-time'})}
+    : {ok:true,status:206,headers:{get:name=>name === 'content-range' ? 'bytes 0-0/524288' : '1'},body:{cancel:async()=>{cancelled++;}}};
+  const result = await p.context.window.__codexJupyter('stat', {path:'work/link.bin'});
+  assert.equal(result.ok, true);
+  assert.equal(result.data.range_size, 524288);
+  assert.equal(result.data.size, 10);
+  assert.equal(cancelled, 1);
+});
+
+test('stat recognizes empty targets and cancels an ignored range without reading it', async () => {
+  const p = page();
+  let status = 416, cancelled = 0;
+  p.context.fetch = async (url) => url.includes('api/contents/')
+    ? {ok:true,status:200,headers:{get:()=> 'application/json'},json:async()=>({type:'file',size:9,last_modified:'link-time'})}
+    : {ok:false,status,headers:{get:name=>name === 'content-range' ? 'bytes */0' : '0'},body:{cancel:async()=>{cancelled++;}}};
+  assert.equal((await p.context.window.__codexJupyter('stat', {path:'work/link'})).data.range_size, 0);
+  status = 200;
+  assert.equal((await p.context.window.__codexJupyter('stat', {path:'work/link'})).data.range_size, null);
+  assert.equal(cancelled, 2);
+});
+
 test('separate controller pages do not share kernel ownership or cleanup', async () => {
   const shared = new Map();
   const a = page(shared), b = page(shared);

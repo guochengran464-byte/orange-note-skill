@@ -15,7 +15,10 @@ python scripts/sn.py doctor
 ```
 
 If the executable is outside PATH, set `BSK_BIN` to its full path. The tested
-combination used Windows, Edge, CLI 0.3.2 and extension 0.3.3.
+combinations include Windows/Edge with CLI and extension 0.4.0; the earlier
+0.3.2/0.3.3 pairing was validated for v4.1.4. See the versioned validation record.
+The CLI, active daemon and extension must be compatible. With 0.4, Orange Note
+automatically obtains a fresh shared-control context before each guarded action.
 
 In a host that cannot start a detached Windows daemon, use its managed background
 task facility to run:

@@ -1,5 +1,20 @@
 # Changelog
 
+## 4.2.0 — 2026-10-30
+
+- Support BrowserSkill 0.4 shared control: synchronize before each existing-tab
+  navigation and evaluation, use a single-use context, and do not dispatch
+  while control is unavailable. Retain the initial owned blank-tab navigation.
+- Preserve the existing BrowserSkill 0.3 calling path. A missing or unparseable
+  CLI version fails closed before a browser action.
+- Report coordination failures at startup and in deep diagnostics without
+  incorrectly suggesting a refresh. Never replay an uncertain operation.
+- When Contents metadata reports a symlink's own size, compare a bounded HTTP
+  range response and verify the link target in the controller-owned kernel.
+  Target identity and modification metadata participate in resume validation.
+- Keep existing logical sessions, workspace configuration, job receipts, and
+  transfer policies; see the validation record for tested combinations.
+
 ## 4.1.4 — 2026-10-24
 
 ### Session lifecycle
