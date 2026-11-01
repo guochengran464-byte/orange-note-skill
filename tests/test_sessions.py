@@ -38,7 +38,7 @@ class Sessions(unittest.TestCase):
         sequence = iter(range(1, 20))
 
         def bsk(*args, session=None, tab_id=None, **kwargs):
-            if args == ("session", "start"):
+            if args == ("session", "start", "--focus"):
                 number = next(sequence)
                 sid = "browser-" + str(number)
                 live[sid] = {"tab_id": number, "scope": "agent", "url": "about:blank"}
@@ -149,6 +149,34 @@ class Sessions(unittest.TestCase):
                 child.kill()
                 child.communicate(timeout=5)
 
+
+
+    def test_new_agent_windows_start_focused_for_jupyter_startup(self):
+        with patch.object(sn, "bsk", return_value={"session_id": "focused"}) as start, \
+                patch.object(sn, "_save_browser_state"):
+            self.assertEqual(sn.ensure_session(force=True), "focused")
+        start.assert_called_once_with("session", "start", "--focus", timeout=120)
+
+    def test_startup_waits_for_jupyter_frontend(self):
+        expressions = []
+        replies = iter(["https://inner.dcs.cloud/notebook/st/w/lab", False, True])
+
+        def evaluate(tab_id, expression, timeout=60, session_id=None):
+            expressions.append(expression)
+            return next(replies)
+
+        with patch.object(sn, "ensure_session", return_value="s"), \
+                patch.object(sn, "_browser_state", return_value={}), \
+                patch.object(sn, "_agent_tabs", return_value=[{"tab_id": 1}]), \
+                patch.object(sn, "bsk", return_value={"tab_id": 1}), \
+                patch.object(sn, "WORKSPACE_URL", URL), \
+                patch.object(sn, "_eval_js", side_effect=evaluate), \
+                patch.object(sn, "_probe_tab", return_value=True) as probe, \
+                patch.object(sn, "_save_browser_state"), \
+                patch.object(sn.time, "sleep", return_value=None):
+            self.assertEqual(sn.ensure_tab(settle=5), 1)
+        self.assertTrue(any("jupyterlab-splash" in expression for expression in expressions))
+        self.assertEqual(probe.call_count, 1)
 
 if __name__ == "__main__":
     unittest.main()

@@ -582,6 +582,7 @@ echo __SN_SUBMITTED__={job_id}
 # ─────────────────────────── browser transport (Tencent BrowserSkill) ───────────────────────────
 INNER_ORIGIN = "https://inner.dcs.cloud"
 IFRAME_SRC_JS = "(document.querySelector('iframe[src*=\"inner.dcs.cloud/notebook/st/\"]')||{}).src||''"
+FRONTEND_READY_JS = "document.readyState === 'complete' && !document.getElementById('jupyterlab-splash')"
 TASK_BASE_RE = re.compile(r"^https://inner\.dcs\.cloud(/notebook/st/[A-Za-z0-9_.-]+/)")
 MAX_EXPR_CHARS = 24000   # Windows argv ceiling is 32767; leave room for flags/paths
 MAX_CHUNK_CHARS = 16000
@@ -696,7 +697,7 @@ def ensure_session(force=False):
         if LOGICAL_SESSION_ID:
             _ACTIVE_BROWSER_SESSION = session_id
         return session_id
-    started = bsk("session", "start", timeout=120)
+    started = bsk("session", "start", "--focus", timeout=120)
     session_id = started.get("session_id") if isinstance(started, dict) else None
     if not session_id:
         raise Bridge("bsk_session_start_failed: 未返回 session_id")
@@ -833,7 +834,7 @@ def ensure_tab(force=False, full_probe=False, settle=60):
     probe_deadline = time.monotonic() + 45
     while True:
         try:
-            if _probe_tab(tab_id, lite=not full_probe):
+            if _eval_js(tab_id, FRONTEND_READY_JS, 30) and _probe_tab(tab_id, lite=not full_probe):
                 break
         except Bridge as exc:
             if str(exc).startswith("jupyter_auth_required:") or _is_cooperation_error(exc):

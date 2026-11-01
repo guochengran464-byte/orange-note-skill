@@ -35,7 +35,7 @@ class WorkspaceRace(unittest.TestCase):
             def fake_bsk(*args, session=None, tab_id=None, **kwargs):
                 if args == ("session", "list"):
                     return [{"session_id": value} for value in sessions]
-                if args == ("session", "start"):
+                if args == ("session", "start", "--focus"):
                     sessions["sB"] = 8
                     return {"session_id": "sB"}
                 if args == ("tab", "list"):
