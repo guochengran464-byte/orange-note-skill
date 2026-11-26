@@ -35,7 +35,7 @@ class WorkspaceRace(unittest.TestCase):
             def fake_bsk(*args, session=None, tab_id=None, **kwargs):
                 if args == ("session", "list"):
                     return [{"session_id": value} for value in sessions]
-                if args == ("session", "start", "--focus"):
+                if args == ("session", "start"):
                     sessions["sB"] = 8
                     return {"session_id": "sB"}
                 if args == ("tab", "list"):
@@ -62,7 +62,7 @@ class WorkspaceRace(unittest.TestCase):
             def switch_after_selection():
                 selected = select_a()
                 other = b.ensure_tab()
-                self.assertTrue(pages[other].endswith("/B/lab"))
+                self.assertIn("/notebook/st/B/", pages[other])
                 return selected
 
             stack.enter_context(patch.object(a, "ensure_tab", side_effect=switch_after_selection))

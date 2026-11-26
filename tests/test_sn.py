@@ -1210,7 +1210,8 @@ class PublicReleaseSafetyTests(unittest.TestCase):
         self.assertIn("traceback: clipText", source)
 
 
-@unittest.skipIf(os.name == "nt", "local launcher integration uses POSIX setsid/bash")
+@unittest.skipIf(os.name == "nt" or shutil.which("setsid") is None,
+                 "remote Linux launcher integration requires setsid/bash")
 class LocalLauncherIntegrationTests(unittest.TestCase):
     def test_launcher_executes_from_requested_cwd_and_finishes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1415,7 +1416,8 @@ class ConnectionRecoveryTests(unittest.TestCase):
                  lambda url, tab: {"tab_id": tab, "final_url": url})):
             self.assertEqual(sn.ensure_tab(settle=3), 9)
         navigations = [c for c in calls if c["args"][0] == "navigate"]
-        self.assertEqual([c["args"][1] for c in navigations], [self.url, self.inner])
+        self.assertEqual([c["args"][1] for c in navigations],
+                         [self.url, "https://inner.dcs.cloud/notebook/st/task-p/sn-agent-lite"])
         self.assertEqual([c["tab_id"] for c in navigations], [9, 9])
         save.assert_called()
 

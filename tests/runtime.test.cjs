@@ -161,3 +161,67 @@ test('owned kernel survives runtime reinjection and is cleaned up explicitly', a
   await p.context.window.__codexJupyter('cleanup', {});
   assert.equal(p.events.deletes, 1);
 });
+
+test('read_range reads tail bytes via HTTP Range without creating a kernel', async () => {
+  const p = page();
+  const full = Buffer.from('0123456789ABCDEF');
+  p.context.TextDecoder = TextDecoder;
+  p.context.fetch = async (url, opts = {}) => {
+    if (url.includes('api/contents/')) {
+      return {ok: true, status: 200, headers: {get: () => 'application/json'},
+        json: async () => ({type: 'file', size: full.length, last_modified: 't'})};
+    }
+    const range = opts.headers && opts.headers.Range;
+    if (range === 'bytes=0-0') {
+      return {ok: true, status: 206, headers: {get: k => k === 'content-range' ? `bytes 0-0/${full.length}` : '1'},
+        body: {cancel: async () => {}}};
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(range);
+    const slice = full.subarray(Number(m[1]), Number(m[2]) + 1);
+    return {ok: true, status: 206, headers: {get: () => String(slice.length)},
+      arrayBuffer: async () => slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength)};
+  };
+  const tail = await p.context.window.__codexJupyter('read_range', {path: 'work/a.log', mode: 'tail', max_bytes: 6});
+  assert.equal(tail.ok, true);
+  assert.equal(tail.data.text, 'ABCDEF');
+  assert.equal(tail.data.truncated, true);
+  assert.equal(p.events.creates, 0);
+});
+
+test('batch_http executes multiple read requests in one evaluate call', async () => {
+  const p = page();
+  p.context.fetch = async (url) => {
+    if (url.includes('content=0')) {
+      return {ok: true, status: 200, headers: {get: () => 'application/json'}, json: async () => ({size: 5})};
+    }
+    const name = url.includes('a.json') ? '{"a":1}' : '{"b":2}';
+    return {ok: true, status: 200, headers: {get: () => 'application/json'}, json: async () => ({content: name})};
+  };
+  const res = await p.context.window.__codexJupyter('batch_http', {
+    requests: [
+      {id: 'a', kind: 'read', path: 'work/a.json', max_bytes: 1024},
+      {id: 'b', kind: 'read', path: 'work/b.json', max_bytes: 1024},
+    ]
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.data.results.a.content, '{"a":1}');
+  assert.equal(res.data.results.b.content, '{"b":2}');
+  assert.equal(p.events.creates, 0);
+});
+
+test('put_chunk and rename_path call Jupyter Contents API', async () => {
+  const p = page();
+  const seen = [];
+  p.context.fetch = async (url, opts = {}) => {
+    seen.push({url, method: opts.method || 'GET', body: opts.body ? JSON.parse(opts.body) : null});
+    return {ok: true, status: 200, headers: {get: () => 'application/json'}, json: async () => ({size: 4})};
+  };
+  const r1 = await p.context.window.__codexJupyter('put_chunk', {path: 'work/a.tmp', b64: 'QUJDRA==', chunk: -1});
+  const r2 = await p.context.window.__codexJupyter('rename_path', {old_path: 'work/a.tmp', new_path: 'work/a.bin'});
+  assert.equal(r1.ok, true);
+  assert.equal(r2.ok, true);
+  assert.equal(seen[0].method, 'PUT');
+  assert.equal(seen[0].body.chunk, -1);
+  assert.equal(seen[1].method, 'PATCH');
+  assert.equal(seen[1].body.path, 'work/a.bin');
+});

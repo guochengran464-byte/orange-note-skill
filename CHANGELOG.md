@@ -1,5 +1,20 @@
 # Changelog
 
+## 5.0.0 — 2026-11-26
+
+- Add safe pre-dispatch retries in `bsk()` for BrowserSkill 0.4+/0.5+ transient DOM
+  observation races while strictly refusing to retry human takeover (`mode != ready`)
+  or post-dispatch errors.
+- Diagnose DCS login expiration, stopped workspace containers, and startup stalls
+  explicitly during `connect`.
+- Add kernel-free pure-HTTP fast paths: `read_range` (`cat --tail`, `cat --bytes`),
+  `batch_http` (`multi-cat`, `poll --lite`), and `runner.sh` heartbeats + `sn_stage`.
+- Add server-side batch queue orchestration (`batch submit/status/retry-failed/cancel`,
+  `prune --batch`), directory sync (`sync-up`/`sync-down`), chunked Contents API upload
+  (`--allow-large`), host resource health check (`host-health`), scientific compute
+  guardrails (`--threads`, `--local-tmp`), sequencing format inspection
+  (`.fastq.gz`, `.bam`, `.gtf`, `.gff`, `.paf`, `.vcf.gz`), and `SN_SESSION` env support.
+
 ## 4.2.0 — 2026-10-30
 
 - Support BrowserSkill 0.4 shared control: synchronize before each existing-tab

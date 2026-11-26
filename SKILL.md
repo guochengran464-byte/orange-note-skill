@@ -7,7 +7,12 @@ description: >
   when the user requests Orange Note or authorizes operations in that workspace.
 ---
 
-# Orange Note — v4.2.0
+# Orange Note — v5.0.0
+
+Local macOS adaptation: use `scripts/sn` in place of `python scripts/sn.py` on
+macOS/Linux. It finds Codex's bundled Python without invoking Apple's developer
+tools placeholder. See [macOS setup](docs/MACOS.md). BrowserSkill 0.4.1+ script
+calls include the fresh top-level observation receipt required by target policy.
 
 Use the bundled CLI for repeatable Agent operations through BrowserSkill and the
 current user's browser login. The built-in connector accepts DCS StereoNote URLs;
@@ -30,7 +35,7 @@ other websites and self-hosted notebook servers need a matching connector.
    If creation fails after allocating an ID, retain that ID and recover using
    `--session <id> connect`. Use `session list` to find saved IDs; it is not a live probe.
 
-Use Windows Python, an already logged-in Edge/Chrome profile, BrowserSkill CLI,
+Use Python 3 on Windows/macOS/Linux, an already logged-in Edge/Chrome profile, BrowserSkill CLI,
 and its connected extension. Operate only controller-owned Agent Window tabs.
 Keep the CLI, runtime JavaScript, metadata and documents together when installing.
 BrowserSkill 0.4 uses a fresh shared-control context for each navigation or
@@ -58,26 +63,55 @@ errors keep the existing page and report the error rather than refreshing it.
 
 ```bash
 python scripts/sn.py --session <id> doctor --deep
+python scripts/sn.py --session <id> host-health
 python scripts/sn.py --session <id> ls work/project
-python scripts/sn.py --session <id> cat work/project/run.py
+python scripts/sn.py --session <id> cat work/project/run.py [--tail] [--bytes 32768]
+python scripts/sn.py --session <id> multi-cat work/a.log work/b.log --tail
 python scripts/sn.py --session <id> write work/project/note.txt --content "hello"
 python scripts/sn.py --session <id> get work/project/figure.png --out ./figure.png
-python scripts/sn.py --session <id> put ./report.pdf --remote work/project/report.pdf
-python scripts/sn.py --session <id> inspect /data/work/project/data.h5ad
+python scripts/sn.py --session <id> put ./report.pdf --remote work/project/report.pdf [--allow-large]
+python scripts/sn.py --session <id> sync-up ./scripts --remote work/project/scripts
+python scripts/sn.py --session <id> sync-down work/project/results --out ./results --glob "*.tsv,*.pdf,*.png"
+python scripts/sn.py --session <id> inspect /data/work/project/data.h5ad  # also .bam/.fastq.gz/.gtf/.paf/.vcf.gz/.rds/.parquet/.tsv
 python scripts/sn.py --session <id> run-python --code "print(1 + 1)"
 python scripts/sn.py --session <id> run-shell --cwd /data/work/project --cmd "python check.py"
-python scripts/sn.py --session <id> submit --cwd /data/work/project --cmd "python pipeline.py" --idempotency-key <id>:project-run-1
+python scripts/sn.py --session <id> submit --cwd /data/work/project --cmd "bash pipeline.sh" --threads 4 --local-tmp --idempotency-key <id>:run-1
 python scripts/sn.py --session <id> jobs --remote
-python scripts/sn.py --session <id> poll <job_id>
+python scripts/sn.py --session <id> poll <job_id> [--lite]
 python scripts/sn.py --session <id> artifacts <job_id>
 python scripts/sn.py --session <id> cancel <job_id>
 python scripts/sn.py --session <id> accept <job_id> --note "results reviewed"
-python scripts/sn.py --session <id> prune --days 30 --dry-run
+python scripts/sn.py --session <id> prune --days 30 [--batch <batch_id>] --dry-run
+
+# Server-side multi-sample batch orchestration
+python scripts/sn.py --session <id> batch submit --batch cohort1 --manifest samples.tsv --max-concurrent 2 --threads 4 --local-tmp --cwd /data/work/project --cmd-template 'bash run_one.sh {sample_id} {fastq}'
+python scripts/sn.py --session <id> batch status cohort1 [--logs]
+python scripts/sn.py --session <id> batch retry-failed cohort1
+python scripts/sn.py --session <id> batch cancel cohort1
 ```
 
+You may export `SN_SESSION=<id>` per shell/agent instead of repeating `--session <id>`
+(still never persisted globally, so concurrent agents remain isolated).
 `work/...` maps to `/data/work/...`; shell cwd defaults to `/data/work`.
-Use `ls --all` when dotfiles matter. Small reads use the file API; larger text
-previews and external mounts use bounded kernel helpers.
+Use `ls --all` when dotfiles matter. `cat` (including `--tail`), `multi-cat`,
+`poll --lite`, and `batch status` use pure HTTP (Contents / Range) without starting
+a Jupyter kernel, so they stay responsive even under high host load.
+
+## High-throughput batch & compute routing rules
+
+- Run `host-health` before launching heavy multi-sample compute. If `load_per_cpu >= 1.5`
+  (`recommendation: use_offline_dedicated_node`), use StereoNote for environment setup,
+  `sync-up` script deployment, smoke checks, and result aggregation, and hand heavy
+  multi-sample alignment/calling to DCS offline dedicated nodes (`64c/128c`).
+- Inside submitted or batch scripts, call `sn_stage "<stage>" [done] [total] [note]`
+  (auto-exported by `runner.sh`) to update `stage.json` atomically for `poll --lite`
+  and `batch status`.
+- Use `--threads N` on shared hosts to prevent OpenBLAS/OMP thread storms, and
+  `--local-tmp` to keep scratch I/O on `/tmp` with automatic cleanup on exit.
+- `connect` parks controller tabs on a lightweight same-origin HTML endpoint
+  (`.../sn-agent-lite`) instead of loading the heavy JupyterLab `/lab` SPA, preventing
+  multi-tab workspace collisions (`auto-N`), frontend polling freezes, and DOM churn.
+  Use `connect --refresh` to explicitly recover a stuck tab or restarted container.
 
 ## Execution and file rules
 
