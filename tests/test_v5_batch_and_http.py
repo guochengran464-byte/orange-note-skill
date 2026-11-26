@@ -323,11 +323,13 @@ class Phase2And3Tests(unittest.TestCase):
                 exec(code, {})
             return {"ok": True, "data": {"stdout": buf.getvalue()}}
 
-        with patch.object(sn, "run_python", side_effect=run_local):
-            r_fq = sn.inspect(str(fq))
-            r_gtf = sn.inspect(str(gtf))
-            r_paf = sn.inspect(str(paf))
-            r_vcf = sn.inspect(str(vcf))
+        fixtures = {f"work/{path.name}": str(path) for path in (fq, gtf, paf, vcf)}
+        with patch.object(sn, "to_server", side_effect=fixtures.__getitem__), \
+             patch.object(sn, "run_python", side_effect=run_local):
+            r_fq = sn.inspect(f"work/{fq.name}")
+            r_gtf = sn.inspect(f"work/{gtf.name}")
+            r_paf = sn.inspect(f"work/{paf.name}")
+            r_vcf = sn.inspect(f"work/{vcf.name}")
 
         self.assertEqual(r_fq["format"], "fastq")
         self.assertEqual(r_fq["sampled_reads"], 2)
