@@ -6,7 +6,7 @@ Orange Note 是面向 Claude Code、Codex 等 Agent 的通用操作技能。它�
 有界执行和任务跟踪整理成一组 CLI 命令，通过 BrowserSkill 使用已有浏览器登录状态，
 在受支持的 Jupyter 工作区中完成操作，无需向 Agent 复制登录凭据。
 
-**版本：v4.2.0 · 许可证：MIT**
+**版本：v5.0.0 · 许可证：MIT**
 
 ## 能做什么
 
@@ -26,8 +26,8 @@ Orange Note 是面向 Claude Code、Codex 等 Agent 的通用操作技能。它�
 
 ## 安装
 
-前置条件：Windows、Python 3、Edge 或 Chrome，以及已连接的 BrowserSkill CLI 和扩展。
-Python 端只使用标准库。[BrowserSkill 安装与连接说明](docs/BROWSERSKILL_INSTALL.md)。
+前置条件：Python 3、Edge 或 Chrome，以及已连接的 BrowserSkill CLI 和扩展。
+Python 端只使用标准库。参见 [BrowserSkill 安装与连接说明](docs/BROWSERSKILL_INSTALL.md)和 [macOS 设置](docs/MACOS.md)。
 
 将仓库内容放入对应技能目录，保留 `scripts/`、`agents/` 和文档：
 
@@ -177,8 +177,8 @@ node --test tests/runtime.test.cjs
 
 v4.1.0 已完成少量针对性检查，以及 3 个 Luna Agent 进入同一工作区的真实浏览器实测：
 独立内核、变量保留、重叠执行和关闭一个 session 不影响其他 session 均通过。
-当前版本的检查范围见 [v4.2.0 验证记录](docs/VALIDATION_v4.2.0.md)，
-本次变化见 [v4.2.0 更新说明](docs/RELEASE_v4.2.0.md)，
-历史变化见 [v4.1.4 发布说明](docs/RELEASE_v4.1.4.md)；
+本次变化见 [v5.0.0 更新说明](docs/RELEASE_v5.0.0.md)。
+历史检查见 [v4.2.0 验证记录](docs/VALIDATION_v4.2.0.md)和
+[v4.1.4 发布说明](docs/RELEASE_v4.1.4.md)；
 会话功能的历史实测见 [v4.1.0 记录](docs/VALIDATION_v4.1.0.md)，旧引擎的历史验证见
 [v4.0.1 记录](docs/VALIDATION_v4.0.1.md)，版本变化见 [CHANGELOG.md](CHANGELOG.md)。

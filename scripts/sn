@@ -1,0 +1,20 @@
+#!/bin/sh
+# macOS/Linux launcher. Avoid Apple's developer-tools placeholder interpreter.
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -n "${ORANGE_NOTE_PYTHON:-}" ]; then
+    exec "$ORANGE_NOTE_PYTHON" "$script_dir/sn.py" "$@"
+fi
+for candidate in \
+    "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3" \
+    /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" "$script_dir/sn.py" "$@"
+    fi
+done
+candidate=$(command -v python3 || true)
+if [ -n "$candidate" ] && { [ "$(uname -s)" != Darwin ] || [ "$candidate" != /usr/bin/python3 ]; }; then
+    exec "$candidate" "$script_dir/sn.py" "$@"
+fi
+echo 'Python 3 is required. Set ORANGE_NOTE_PYTHON to a working interpreter.' >&2
+exit 127

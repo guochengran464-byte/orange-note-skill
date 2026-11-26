@@ -35,6 +35,27 @@ class CooperationTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotIn('--context', calls[0])
 
+    def test_042_script_uses_top_level_observation_receipt(self):
+        ready = {'state': {'mode':'ready'}, 'context_id':'fresh',
+                 'observation_id':'receipt', 'observation':{'observation_id':'ref-map'}}
+        result, calls = self.call('bsk 0.4.2', [ready, {'ok':True, 'value':2}],
+                                  'evaluate', '1+1', session='one', tab_id=7)
+        self.assertEqual(result['value'], 2)
+        self.assertEqual(calls[1][calls[1].index('--observation') + 1], 'receipt')
+
+    def test_042_missing_receipt_never_dispatches_script(self):
+        ready = {'state': {'mode':'ready'}, 'context_id':'fresh',
+                 'observation':{'observation_id':'ref-map'}}
+        with self.assertRaisesRegex(sn.Bridge, 'cooperation_observation_missing'):
+            self.call('bsk 0.4.2', [ready], 'evaluate', 'danger()', session='one', tab_id=7)
+
+    def test_042_navigation_uses_observation_receipt(self):
+        tabs = {'tabs':[{'scope':'agent', 'tab_id':7, 'url':'https://example.test'}]}
+        ready = {'state':{'mode':'ready'}, 'context_id':'next', 'observation_id':'receipt'}
+        _, calls = self.call('bsk 0.4.2', [tabs, ready, {'tab_id':7}],
+                             'navigate', 'https://example.test/next', session='one', tab_id=7)
+        self.assertEqual(calls[2][calls[2].index('--observation') + 1], 'receipt')
+
     def test_unready_never_dispatches_execution(self):
         outputs = [{'state': {'mode':'user'}, 'context_id':None}]
         with self.assertRaisesRegex(sn.Bridge, 'cooperation_not_ready'):

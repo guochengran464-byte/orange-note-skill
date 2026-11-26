@@ -32,7 +32,7 @@
   var B = discoverBase();
   // Keep in sync with CONTROLLER_VERSION in sn.py. A stale value makes a reinjection
   // of newer code a silent no-op, because the guard below returns early.
-  var runtimeKey = "4.2.0:" + B.basePath;
+  var runtimeKey = "5.0.0:" + B.basePath;
   if (window.__snRuntimeKey === runtimeKey && window.__codexJupyter) return;
   var apiUrl = function (p) { return B.baseUrl + String(p).replace(/^\//, ""); };
   var wsBase = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + B.basePath;
@@ -295,6 +295,121 @@
     return { ok: true, status: r.status, len: buf.length, b64: btoa(bin) };
   }
 
+  function decodeUtf8(bytes) {
+    if (typeof TextDecoder === "function") {
+      return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    }
+    var s = "";
+    for (var i = 0; i < bytes.length; i += 8192) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    }
+    try { return decodeURIComponent(escape(s)); } catch (e) { return s; }
+  }
+
+  async function readRangeText(path, mode, maxBytes) {
+    var st = await statFile(path);
+    if (!st.ok) return { ok: false, status: st.status, error: st.error || "stat_failed" };
+    if (st.type !== "file") return { ok: false, status: st.status, error: "not_a_file" };
+    var total = typeof st.range_size === "number" ? st.range_size : st.size;
+    if (typeof total !== "number" || total < 0) {
+      return { ok: false, status: st.status, error: "size_unknown" };
+    }
+    if (total === 0) {
+      return { ok: true, status: 200, size: 0, start: 0, end: -1, bytes_read: 0, truncated: false, text: "" };
+    }
+    var limit = Math.max(1, Math.min(Number(maxBytes) || 16384, 1024 * 1024));
+    var start = mode === "tail" ? Math.max(0, total - limit) : 0;
+    var end = mode === "tail" ? total - 1 : Math.min(total, limit) - 1;
+    var url = B.basePath + "files/" + encPath(path);
+    var r = await fetch(url, { credentials: "same-origin", cache: "no-store",
+                               headers: { Range: "bytes=" + start + "-" + end } });
+    if (r.status !== 206 && r.status !== 200) {
+      return { ok: false, status: r.status, error: "range_failed" };
+    }
+    var expected = end - start + 1;
+    var declared = Number(r.headers.get("content-length"));
+    if ((r.status === 200 && (start !== 0 || declared !== expected)) || declared > expected) {
+      if (r.body) await r.body.cancel();
+      return { ok: false, status: r.status, error: "range_not_supported" };
+    }
+    var buf = new Uint8Array(await r.arrayBuffer());
+    return { ok: true, status: r.status, size: total, start: start, end: start + buf.length - 1,
+             bytes_read: buf.length, truncated: buf.length < total, text: decodeUtf8(buf) };
+  }
+
+  async function batchHttp(requests) {
+    if (!Array.isArray(requests)) return { ok: false, error: "invalid_requests" };
+    var list = requests.slice(0, 64);
+    var results = {};
+    var idx = 0;
+    async function worker() {
+      while (idx < list.length) {
+        var current = list[idx++];
+        var key = String(current && current.id != null ? current.id : idx);
+        try {
+          var kind = current && current.kind;
+          if (kind === "read") results[key] = await readFile(current.path, current.max_bytes);
+          else if (kind === "read_range") results[key] = await readRangeText(current.path, current.mode || "head", current.max_bytes);
+          else if (kind === "list") results[key] = await listDir(current.path || "");
+          else if (kind === "stat") results[key] = await statFile(current.path);
+          else results[key] = { ok: false, error: "unknown_batch_kind" };
+        } catch (e) {
+          results[key] = { ok: false, error: String((e && e.message) || e) };
+        }
+      }
+    }
+    var workers = [];
+    var concurrency = Math.min(8, Math.max(1, list.length));
+    for (var w = 0; w < concurrency; w++) workers.push(worker());
+    await Promise.all(workers);
+    return { ok: true, results: results, truncated: requests.length > list.length };
+  }
+
+  async function ensureDir(path) {
+    var parts = String(path || "").split("/").filter(Boolean);
+    var cur = "";
+    for (var i = 0; i < parts.length; i++) {
+      cur = cur ? cur + "/" + parts[i] : parts[i];
+      var chk = await jf("api/contents/" + encPath(cur) + "?content=0");
+      if (chk.ok) continue;
+      var mk = await jf("api/contents/" + encPath(cur), {
+        method: "PUT", body: JSON.stringify({ type: "directory" })
+      });
+      if (!mk.ok && mk.status !== 409) {
+        return { ok: false, status: mk.status, error: "mkdir_failed", path: cur };
+      }
+    }
+    return { ok: true, status: 200 };
+  }
+
+  async function putChunk(path, b64, chunk) {
+    var body = { type: "file", format: "base64", content: b64 };
+    if (chunk !== undefined && chunk !== null) body.chunk = chunk;
+    var r = await jf("api/contents/" + encPath(path), { method: "PUT", body: JSON.stringify(body) });
+    if (!r.ok) {
+      var detail = typeof r.body === "string" ? r.body.slice(0, 160) : (r.body && r.body.message ? String(r.body.message).slice(0, 160) : "");
+      return { ok: false, status: r.status, error: "put_chunk_failed:" + r.status + (detail ? ":" + detail : "") };
+    }
+    return { ok: true, status: r.status, size: r.body && r.body.size };
+  }
+
+  async function renamePath(oldPath, newPath) {
+    var r = await jf("api/contents/" + encPath(oldPath), {
+      method: "PATCH", body: JSON.stringify({ path: newPath })
+    });
+    if (!r.ok) {
+      var detail = typeof r.body === "string" ? r.body.slice(0, 160) : (r.body && r.body.message ? String(r.body.message).slice(0, 160) : "");
+      return { ok: false, status: r.status, error: "rename_failed:" + r.status + (detail ? ":" + detail : "") };
+    }
+    return { ok: true, status: r.status };
+  }
+
+  async function deletePath(path) {
+    var r = await jf("api/contents/" + encPath(path), { method: "DELETE" });
+    if (!r.ok && r.status !== 404) return { ok: false, status: r.status, error: "delete_failed" };
+    return { ok: true, status: r.status };
+  }
+
   async function cleanupKernels() {
     var ids = ownedKernels();
     var live = storageGet(KERNEL_KEY);
@@ -326,6 +441,30 @@
       if (op === "fetch_range") {
         var fr = await fetchRange(payload.path, payload.start, payload.end);
         return { ok: !!fr.ok, data: fr, error: fr.error || null };
+      }
+      if (op === "read_range") {
+        var rr = await readRangeText(payload.path, payload.mode || "head", payload.max_bytes);
+        return { ok: !!rr.ok, data: rr, error: rr.error || null };
+      }
+      if (op === "batch_http") {
+        var bh = await batchHttp(payload.requests);
+        return { ok: !!bh.ok, data: bh, error: bh.error || null };
+      }
+      if (op === "ensure_dir") {
+        var ed = await ensureDir(payload.path);
+        return { ok: !!ed.ok, data: ed, error: ed.error || null };
+      }
+      if (op === "put_chunk") {
+        var pc = await putChunk(payload.path, payload.b64, payload.chunk);
+        return { ok: !!pc.ok, data: pc, error: pc.error || null };
+      }
+      if (op === "rename_path") {
+        var rp = await renamePath(payload.old_path, payload.new_path);
+        return { ok: !!rp.ok, data: rp, error: rp.error || null };
+      }
+      if (op === "delete_path") {
+        var dp = await deletePath(payload.path);
+        return { ok: !!dp.ok, data: dp, error: dp.error || null };
       }
       if (op === "run_python") {
         var data = await runPython(payload.code || "", payload.timeout_ms, payload.stream_limit_chars);

@@ -5,14 +5,14 @@ the built-in Jupyter workspace connector. Browser credentials stay in the page.
 The existing sn.py filename and runtime configuration remain compatible.
 """
 from __future__ import annotations
-import argparse, base64, binascii, errno, hashlib, json, os, posixpath, re, shlex, shutil, subprocess, sys, time, uuid
+import argparse, base64, binascii, csv, errno, fnmatch, hashlib, io, json, os, posixpath, re, shlex, shutil, subprocess, sys, tarfile, time, uuid
 from contextlib import contextmanager
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.dirname(HERE)
 RUNTIME_JS_PATH = os.path.join(HERE, "jupyter_runtime.js")
-CONTROLLER_VERSION = "4.2.0"
+CONTROLLER_VERSION = "5.0.0"
 LOGICAL_SESSION_ID = None
 _ACTIVE_BROWSER_SESSION = None
 
@@ -21,6 +21,7 @@ DEFAULT_CFG = {
     "session": "stereonote",
     "work_root": "/data/work",
     "bsk_bin": "",
+    "bsk_browser_id": "",
 }
 CONFIG_EXAMPLE_PATH = os.path.join(SKILL_DIR, "config.example.json")
 LEGACY_CONFIG_PATH = os.path.join(SKILL_DIR, "config.json")
@@ -160,7 +161,7 @@ def save_url(url):
     WORKSPACE_URL = _build_workspace_url(project_id, workspace_id)
     WORKSPACE_URL_ERROR = None
     cfg = _read_json(config_path())
-    for key in ("session", "work_root", "bsk_bin"):
+    for key in ("session", "work_root", "bsk_bin", "bsk_browser_id"):
         cfg.setdefault(key, CFG.get(key, DEFAULT_CFG[key]))
     cfg["project_id"] = project_id
     cfg["workspace_id"] = workspace_id
@@ -181,6 +182,11 @@ def save_url(url):
 WORK_ROOT = CFG.get("work_root", "/data/work").rstrip("/")
 INSPECT_ROOT = "/data/work"
 JOB_ROOT = "/data/work/agent_jobs"
+BATCH_ROOT = "/data/work/agent_jobs/batches"
+MAX_CHUNKED_UPLOAD_BYTES = 64 * 1024 * 1024
+CHUNKED_UPLOAD_SLICE = 512 * 1024
+OBSERVATION_RETRY_ATTEMPTS = 4
+OBSERVATION_RETRY_BASE_SEC = 0.4
 MAX_LOG_TAIL = 200
 MAX_LOG_BYTES = 64 * 1024
 MAX_STATUS_BYTES = 4096
@@ -266,7 +272,9 @@ def create_logical_session(url):
     session_id = str(uuid.uuid4())
     directory = _logical_dir(session_id)
     os.makedirs(directory, mode=0o700, exist_ok=False)
-    cfg = {key: CFG.get(key, DEFAULT_CFG[key]) for key in ("work_root", "bsk_bin")}
+    cfg = {key: CFG.get(key, DEFAULT_CFG[key]) for key in ("work_root", "bsk_bin", "bsk_browser_id")}
+    if os.environ.get("BSK_BROWSER"):
+        cfg["bsk_browser_id"] = os.environ["BSK_BROWSER"]
     cfg.update(project_id=project_id, workspace_id=workspace_id, created_at=_utc_now())
     path = os.path.join(directory, "config.json")
     with open(path, "x", encoding="utf-8") as fh:
@@ -438,20 +446,44 @@ def list_receipts(limit=20):
     return records[:limit]
 
 
-def build_job_launcher(job_id, command, cwd=None):
+def build_job_launcher(job_id, command, cwd=None, threads=None, local_tmp=False,
+                       batch_id=None, sample_id=None):
     """Build a detached shell launcher with durable job-state records."""
     job_id = validate_job_id(job_id)
     if not isinstance(command, str) or not command:
         raise ValueError("invalid_command")
     validate_text_payload(command, MAX_COMMAND_BYTES, "command_too_large")
+    if threads is not None:
+        threads = _validate_bounded_int(threads, 1, 256, "invalid_threads")
     jdir = f"{JOB_ROOT}/{job_id}"
     execution_cwd = to_server(cwd or WORK_ROOT)
     qdir = shlex.quote(jdir)
     qcwd = shlex.quote(execution_cwd)
     qjob = shlex.quote(json.dumps(job_id))
-    manifest = json.dumps({"schema_version": 2, "job_id": job_id, "command": command, "cwd": execution_cwd},
-                          ensure_ascii=False, separators=(",", ":"))
+    manifest_obj = {"schema_version": 2, "job_id": job_id, "command": command, "cwd": execution_cwd}
+    if batch_id:
+        manifest_obj["batch_id"] = str(batch_id)
+    if sample_id:
+        manifest_obj["sample_id"] = str(sample_id)
+    if threads is not None:
+        manifest_obj["threads"] = threads
+    if local_tmp:
+        manifest_obj["local_tmp"] = True
+    manifest = json.dumps(manifest_obj, ensure_ascii=False, separators=(",", ":"))
     qmanifest = shlex.quote(manifest)
+    env_lines = []
+    if threads is not None:
+        env_lines.append(
+            f"export OPENBLAS_NUM_THREADS={threads} OMP_NUM_THREADS={threads} "
+            f"MKL_NUM_THREADS={threads} NUMEXPR_NUM_THREADS={threads}"
+        )
+    local_tmp_setup = ""
+    local_tmp_cleanup = ""
+    if local_tmp:
+        tmp_dir = shlex.quote(f"/tmp/sn_job_{job_id}")
+        local_tmp_setup = f"mkdir -p {tmp_dir} && chmod 700 {tmp_dir}\nexport TMPDIR={tmp_dir} SN_TMPDIR={tmp_dir}"
+        local_tmp_cleanup = f"  rm -rf {tmp_dir} 2>/dev/null || true"
+    env_block = "\n".join(x for x in (*env_lines, local_tmp_setup) if x)
     command_delimiter = f"__SN_COMMAND_{uuid.uuid4().hex}__"
     while command_delimiter in command.splitlines():
         command_delimiter = f"__SN_COMMAND_{uuid.uuid4().hex}__"
@@ -471,7 +503,7 @@ chmod 600 {qdir}/stdout.log {qdir}/stderr.log
 printf '%s\\n' {qmanifest} > {qdir}/manifest.json.tmp
 mv {qdir}/manifest.json.tmp {qdir}/manifest.json
 chmod 600 {qdir}/manifest.json
-printf '{{\"state\":\"queued\",\"job_id\":%s}}\\n' {qjob} > {qdir}/status.json.tmp
+printf '{{"state":"queued","job_id":%s}}\\n' {qjob} > {qdir}/status.json.tmp
 mv {qdir}/status.json.tmp {qdir}/status.json
 chmod 600 {qdir}/status.json
 cat > {qdir}/cmd.sh <<'{command_delimiter}'
@@ -487,14 +519,49 @@ printf '%s\\n' "$$" > {qdir}/pid.tmp.$$ && mv {qdir}/pid.tmp.$$ {qdir}/pid
 chmod 600 {qdir}/pid
 printf '%s\\n' "$started_at" > {qdir}/started_at.tmp.$$ && mv {qdir}/started_at.tmp.$$ {qdir}/started_at
 chmod 600 {qdir}/started_at
-printf '{{\"state\":\"running\",\"job_id\":%s,\"pid\":%s,\"started_at\":\"%s\"}}\\n' {qjob} "$$" "$started_at" > {qdir}/status.json.tmp.$$
+printf '{{"state":"running","job_id":%s,"pid":%s,"started_at":"%s"}}\\n' {qjob} "$$" "$started_at" > {qdir}/status.json.tmp.$$
 mv {qdir}/status.json.tmp.$$ {qdir}/status.json
 chmod 600 {qdir}/status.json
+printf '{{"job_id":%s,"pid":%s,"ts":"%s","epoch":%s}}\\n' {qjob} "$$" "$started_at" "$(date -u +%s)" > {qdir}/heartbeat.json.tmp.$$
+mv {qdir}/heartbeat.json.tmp.$$ {qdir}/heartbeat.json
+chmod 600 {qdir}/heartbeat.json
 printf '%s\\n' "$started_at" > {qdir}/runner.ready.tmp.$$ && mv {qdir}/runner.ready.tmp.$$ {qdir}/runner.ready
 chmod 600 {qdir}/runner.ready
+sn_stage() {{
+  local _s="${{1:-unknown}}" _d="${{2:-}}" _t="${{3:-}}" _n="${{4:-}}"
+  python3 -c 'import json, os, sys, time
+p, s, d, t, n = sys.argv[1:6]
+obj = {{"stage": s, "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}
+if d.isdigit(): obj["done"] = int(d)
+if t.isdigit(): obj["total"] = int(t)
+if n: obj["note"] = n[:256]
+tmp = p + ".tmp." + str(os.getpid())
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(obj, fh, ensure_ascii=False)
+    fh.write("\\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, p)' {qdir}/stage.json "$_s" "$_d" "$_t" "$_n" 2>/dev/null || true
+}}
+export -f sn_stage
+_SN_HB_PID=""
+(
+  _sp=""
+  trap '[ -n "$_sp" ] && kill "$_sp" 2>/dev/null || true; exit 0' TERM INT
+  while true; do
+    sleep 60 &
+    _sp=$!
+    wait "$_sp" 2>/dev/null || break
+    _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    _ep=$(date -u +%s)
+    printf '{{"job_id":%s,"pid":%s,"ts":"%s","epoch":%s}}\\n' {qjob} "$$" "$_now" "$_ep" > {qdir}/heartbeat.json.tmp.$$ 2>/dev/null && mv {qdir}/heartbeat.json.tmp.$$ {qdir}/heartbeat.json 2>/dev/null || true
+  done
+) </dev/null >/dev/null 2>&1 &
+_SN_HB_PID=$!
 finalize() {{
   rc=$?
   trap - EXIT TERM INT
+  if [ -n "$_SN_HB_PID" ]; then kill "$_SN_HB_PID" 2>/dev/null || true; wait "$_SN_HB_PID" 2>/dev/null || true; fi
+{local_tmp_cleanup}
   ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   printf '%s\\n' "$ended_at" > {qdir}/ended_at.tmp.$$ && mv {qdir}/ended_at.tmp.$$ {qdir}/ended_at
   chmod 600 {qdir}/ended_at
@@ -551,6 +618,7 @@ trap 'exit 143' TERM
 trap 'exit 130' INT
 export SN_JOB_DIR={qdir}
 export SN_ARTIFACT_DIR={qdir}/artifacts
+{env_block}
 cd {qcwd} || exit 72
 bash {qdir}/cmd.sh > {qdir}/stdout.log 2> {qdir}/stderr.log
 __SN_RUNNER__
@@ -569,7 +637,7 @@ done
 if [ ! -f {qdir}/runner.ready ] || [ -L {qdir}/runner.ready ]; then
   kill "$runner_pid" 2>/dev/null || true
   ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  printf '{{\"state\":\"setup_error\",\"job_id\":%s,\"error\":\"runner_start_timeout\",\"ended_at\":\"%s\"}}\\n' {qjob} "$ended_at" > {qdir}/status.json.tmp.$$
+  printf '{{"state\":\"setup_error\",\"job_id\":%s,\"error\":\"runner_start_timeout\",\"ended_at\":\"%s\"}}\\n' {qjob} "$ended_at" > {qdir}/status.json.tmp.$$
   mv {qdir}/status.json.tmp.$$ {qdir}/status.json
   chmod 600 {qdir}/status.json
   echo runner_start_timeout >&2
@@ -582,7 +650,12 @@ echo __SN_SUBMITTED__={job_id}
 # ─────────────────────────── browser transport (Tencent BrowserSkill) ───────────────────────────
 INNER_ORIGIN = "https://inner.dcs.cloud"
 IFRAME_SRC_JS = "(document.querySelector('iframe[src*=\"inner.dcs.cloud/notebook/st/\"]')||{}).src||''"
-FRONTEND_READY_JS = "document.readyState === 'complete' && !document.getElementById('jupyterlab-splash')"
+PAGE_STATE_JS = (
+    "(() => { const f = document.querySelector('iframe[src*=\"inner.dcs.cloud/notebook/st/\"]');"
+    " const t = ((document.body && document.body.innerText) || '').slice(0, 1200);"
+    " return { href: (location.href || '').split('?')[0], title: document.title || '',"
+    " iframe: f ? f.src : '', text: t }; })()"
+)
 TASK_BASE_RE = re.compile(r"^https://inner\.dcs\.cloud(/notebook/st/[A-Za-z0-9_.-]+/)")
 MAX_EXPR_CHARS = 24000   # Windows argv ceiling is 32767; leave room for flags/paths
 MAX_CHUNK_CHARS = 16000
@@ -643,8 +716,26 @@ def _bsk_call(*args, timeout=120, session=None, tab_id=None):
         message = str(payload.get("message") or "").strip()
         raise Bridge(f"bsk_{payload['code']}({args[0]}): {message}".rstrip(": "))
     if proc.returncode != 0:
-        raise Bridge(f"bsk_failed({args[0]}): exit {proc.returncode}")
+        detail = ""
+        if isinstance(payload, dict):
+            detail = str(payload.get("message") or payload.get("error") or "").strip()[:200]
+        suffix = f" ({detail})" if detail else ""
+        raise Bridge(f"bsk_failed({args[0]}): exit {proc.returncode}{suffix}")
     return payload
+
+
+def _is_transient_observation_error(exc):
+    """Return True only when BrowserSkill rejected an action BEFORE dispatch due to DOM churn.
+
+    Human handoff / non-ready modes (`cooperation_not_ready`) and post-dispatch
+    errors (timeouts, navigation lost) MUST return False and never be retried.
+    """
+    msg = str(exc)
+    return (
+        "Document changed during observation" in msg
+        or "strict observation changed before this action" in msg
+        or "A page frame changed; synchronize before choosing this action" in msg
+    )
 
 
 def bsk(*args, timeout=120, session=None, tab_id=None):
@@ -654,7 +745,8 @@ def bsk(*args, timeout=120, session=None, tab_id=None):
         match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", version)
         if not match:
             raise Bridge("bsk_version_unknown: cannot determine browser coordination requirements")
-        if tuple(map(int, match.groups())) >= (0, 4, 0):
+        parsed_version = tuple(map(int, match.groups()))
+        if parsed_version >= (0, 4, 0):
             if tab_id is None:
                 raise Bridge("agent_tab_unverified: browser action requires a controller-owned tab")
             if args[0] == "navigate":
@@ -665,12 +757,30 @@ def bsk(*args, timeout=120, session=None, tab_id=None):
                     raise Bridge("agent_tab_unverified: navigation requires a controller-owned tab")
                 if tab.get("url") == "about:blank":
                     return _bsk_call(*args, timeout=timeout, session=session, tab_id=tab_id)
-            sync = _bsk_call("cooperate", "sync", "--settle", timeout=30, session=session, tab_id=tab_id)
-            state = sync.get("state") or {} if isinstance(sync, dict) else {}
-            context = sync.get("context_id") if isinstance(sync, dict) else None
-            if state.get("mode") != "ready" or not isinstance(context, str) or not context:
-                raise Bridge("cooperation_not_ready: " + str(state.get("mode") or "unknown"))
-            args = (*args, "--context", context)
+            last_exc = None
+            for attempt in range(OBSERVATION_RETRY_ATTEMPTS):
+                try:
+                    sync = _bsk_call("cooperate", "sync", "--settle", timeout=30, session=session, tab_id=tab_id)
+                    state = sync.get("state") or {} if isinstance(sync, dict) else {}
+                    context = sync.get("context_id") if isinstance(sync, dict) else None
+                    if state.get("mode") != "ready" or not isinstance(context, str) or not context:
+                        raise Bridge("cooperation_not_ready: " + str(state.get("mode") or "unknown"))
+                    call_args = (*args, "--context", context)
+                    # 0.4.1+ target policy guards scripts with the top-level observation
+                    # receipt. The nested observation ID only identifies the ref map.
+                    if parsed_version >= (0, 4, 1):
+                        observation = sync.get("observation_id")
+                        if not isinstance(observation, str) or not observation:
+                            raise Bridge("cooperation_observation_missing: script was not dispatched")
+                        call_args = (*call_args, "--observation", observation)
+                    return _bsk_call(*call_args, timeout=timeout, session=session, tab_id=tab_id)
+                except Bridge as exc:
+                    if not _is_transient_observation_error(exc) or attempt + 1 >= OBSERVATION_RETRY_ATTEMPTS:
+                        raise
+                    last_exc = exc
+                    time.sleep(OBSERVATION_RETRY_BASE_SEC * (2 ** attempt))
+            if last_exc is not None:
+                raise last_exc
     return _bsk_call(*args, timeout=timeout, session=session, tab_id=tab_id)
 
 
@@ -697,7 +807,9 @@ def ensure_session(force=False):
         if LOGICAL_SESSION_ID:
             _ACTIVE_BROWSER_SESSION = session_id
         return session_id
-    started = bsk("session", "start", "--focus", timeout=120)
+    browser = os.environ.get("BSK_BROWSER") or CFG.get("bsk_browser_id")
+    selector = ("--browser", browser) if browser else ()
+    started = bsk("session", "start", *selector, timeout=120)
     session_id = started.get("session_id") if isinstance(started, dict) else None
     if not session_id:
         raise Bridge("bsk_session_start_failed: 未返回 session_id")
@@ -773,6 +885,28 @@ def _probe_tab(tab_id, lite=True, detail=None):
     return bool(result.get("ok")) and data.get("status_code") == 200
 
 
+def _classify_page_state(tab_id, session_id=None):
+    """Best-effort read-only diagnosis when the StereoNote iframe is absent."""
+    try:
+        info = _eval_js(tab_id, PAGE_STATE_JS, 15, session_id=session_id)
+    except Bridge:
+        return None
+    if not isinstance(info, dict):
+        return None
+    href = str(info.get("href") or "")
+    text = str(info.get("text") or "")
+    low = (href + " " + text).lower()
+    if re.search(r"(?:#|/)login(?:[/?#]|$)", href, re.I) or any(
+        k in low for k in ("账号登录", "扫码登录", "登录dcs", "sign in", "log in", "login required")
+    ):
+        return "dcs_login_required: DCS 登录态已失效，请在浏览器中重新登录后重试"
+    if any(k in low for k in ("未启动", "已停止", "已关闭", "启动容器", "容器已停止", "not started", "stopped")):
+        return "workspace_stopped: StereoNote 容器当前未启动，请在 DCS 页面启动工作区后再连接"
+    if any(k in low for k in ("启动中", "排队中", "初始化", "starting", "initializing", "pending", "creating")):
+        return "workspace_starting_timeout: StereoNote 容器仍在启动/排队中，请稍后重试 connect"
+    return None
+
+
 def ensure_tab(force=False, full_probe=False, settle=60):
     """Return the Agent Window tab running the authorized Jupyter workspace."""
     if not WORKSPACE_URL:
@@ -805,7 +939,15 @@ def ensure_tab(force=False, full_probe=False, settle=60):
             return tab_id
 
     tab_id = tabs[0].get("tab_id") if tabs else None
-    nav = bsk("navigate", target_url, session=session_id, timeout=120, tab_id=tab_id)
+    try:
+        nav = bsk("navigate", target_url, session=session_id, timeout=120, tab_id=tab_id)
+    except Bridge as exc:
+        # bsk navigate waits for full `load` (30s default) which can time out (exit 4)
+        # on slow DCS SPA subresources even after the tab has already landed.
+        if tab_id is not None and ("exit 4" in str(exc) or "bsk_timeout(navigate)" in str(exc)):
+            nav = {"tab_id": tab_id}
+        else:
+            raise
     tab_id = nav.get("tab_id") if nav.get("tab_id") is not None else tab_id
     if tab_id is None:
         raise Bridge("tab_unavailable: bsk 未返回标签页")
@@ -827,17 +969,46 @@ def ensure_tab(force=False, full_probe=False, settle=60):
         time.sleep(2)
     task_base = _task_base(iframe_src)
     if not task_base:
+        diagnosis = _classify_page_state(tab_id, session_id=session_id)
+        if diagnosis:
+            raise Bridge(diagnosis)
         raise Bridge("workspace_startup_timeout: 工作区 iframe 在等待时间内未就绪；"
                      "请检查 DCS 工作区是否已启动")
 
-    bsk("navigate", str(iframe_src).split("?", 1)[0], session=session_id, timeout=120, tab_id=tab_id)
+    # Park the controller tab on a lightweight same-origin HTML endpoint instead of
+    # the heavy JupyterLab `/lab` SPA. This avoids multi-tab workspace collisions
+    # (`auto-N`), eliminates continuous frontend polling/DOM churn, and prevents
+    # browser freezes when multiple agent windows are open alongside the user's tab.
+    lite_target = INNER_ORIGIN + task_base + "sn-agent-lite"
+    full_target = str(iframe_src).split("?", 1)[0]
+    use_full = os.environ.get("SN_FULL_UI", "").strip() in ("1", "true", "yes")
+    park_url = full_target if use_full else lite_target
+    try:
+        bsk("navigate", park_url, session=session_id, timeout=120, tab_id=tab_id)
+    except Bridge as exc:
+        if not ("exit 4" in str(exc) or "bsk_timeout(navigate)" in str(exc)):
+            raise
     probe_deadline = time.monotonic() + 45
+    auth_minted = False
     while True:
         try:
-            if _eval_js(tab_id, FRONTEND_READY_JS, 30) and _probe_tab(tab_id, lite=not full_probe):
+            if _probe_tab(tab_id, lite=not full_probe):
                 break
         except Bridge as exc:
-            if str(exc).startswith("jupyter_auth_required:") or _is_cooperation_error(exc):
+            if str(exc).startswith("jupyter_auth_required:"):
+                # On a cold browser profile, the iframe may not have minted the inner
+                # session cookie yet. Hit the authenticated iframe URL once, then re-park
+                # on the lightweight page so `/lab` never stays running in the background.
+                if not use_full and not auth_minted and "?token=" in str(iframe_src):
+                    auth_minted = True
+                    try:
+                        bsk("navigate", str(iframe_src), session=session_id, timeout=60, tab_id=tab_id)
+                        bsk("navigate", lite_target, session=session_id, timeout=60, tab_id=tab_id)
+                        continue
+                    except Bridge:
+                        pass
+                raise
+            if _is_cooperation_error(exc):
                 raise
         if time.monotonic() >= probe_deadline:
             raise Bridge("jupyter_unavailable: 工作区 Jupyter 未就绪（api/status 非 200）")
@@ -1181,22 +1352,379 @@ def get_file(remote, out, overwrite=False, verify=True):
             "verified": "sha256" if remote_sha else "size_only"}
 
 
-def put_file(local, remote, overwrite=False):
+def _put_chunked_bytes(raw, remote, overwrite=False):
+    """Upload up to MAX_CHUNKED_UPLOAD_BYTES via Jupyter Contents chunked PUT with atomic publish."""
+    server_path, contents = _transfer_path(remote)
+    if not server_path.startswith(WORK_ROOT + "/"):
+        raise ValueError("write_path_must_be_under_work_root")
+    if len(raw) > MAX_CHUNKED_UPLOAD_BYTES:
+        raise ValueError(f"upload_too_large: limit {MAX_CHUNKED_UPLOAD_BYTES} bytes")
+    tab = ensure_tab()
+    session_id = ensure_session()
+    dest_exists = False
+    try:
+        _remote_stat(contents, session_id, tab)
+        dest_exists = True
+    except Bridge as exc:
+        if "not_found" not in str(exc):
+            raise
+    if dest_exists and not overwrite:
+        raise Bridge("file_exists_use_overwrite")
+    parent = posixpath.dirname(contents)
+    if parent:
+        ed = _call_js("ensure_dir", {"path": parent}, tab, 30, session_id) or {}
+        if not ed.get("ok"):
+            raise Bridge(f"upload_mkdir_failed: {ed.get('error')}")
+    # Avoid leading dot: Jupyter Contents API rejects hidden files when allow_hidden=False.
+    tmp_name = f"__sn_up_{uuid.uuid4().hex}.tmp"
+    tmp_contents = f"{parent}/{tmp_name}" if parent else tmp_name
+    tmp_server = posixpath.join(posixpath.dirname(server_path), tmp_name)
+    try:
+        if len(raw) <= CHUNKED_UPLOAD_SLICE:
+            b64 = base64.b64encode(raw).decode("ascii")
+            r = _call_js("put_chunk", {"path": tmp_contents, "b64": b64}, tab, 60, session_id) or {}
+            if not r.get("ok"):
+                raise Bridge(f"upload_chunk_failed: {r.get('error')}")
+        else:
+            total_chunks = (len(raw) + CHUNKED_UPLOAD_SLICE - 1) // CHUNKED_UPLOAD_SLICE
+            for idx in range(total_chunks):
+                piece = raw[idx * CHUNKED_UPLOAD_SLICE:(idx + 1) * CHUNKED_UPLOAD_SLICE]
+                chunk_num = -1 if idx == total_chunks - 1 else idx + 1
+                b64 = base64.b64encode(piece).decode("ascii")
+                r = _call_js("put_chunk", {"path": tmp_contents, "b64": b64, "chunk": chunk_num},
+                             tab, 60, session_id) or {}
+                if not r.get("ok"):
+                    raise Bridge(f"upload_chunk_failed({chunk_num}): {r.get('error')}")
+        staged = _remote_stat(tmp_contents, session_id, tab)
+        if staged["size"] != len(raw):
+            raise Bridge("upload_size_mismatch")
+        if dest_exists and overwrite:
+            # Prefer atomic server-side replace so an existing file is never lost on error
+            code = (
+                "import os\n"
+                f"os.chmod({tmp_server!r}, 0o600)\n"
+                f"os.replace({tmp_server!r}, {server_path!r})\n"
+                "print('__SN_REPLACED__')\n"
+            )
+            rep = run_python(code, timeout=30)
+            if "__SN_REPLACED__" not in str((rep.get("data") or {}).get("stdout") or ""):
+                raise Bridge("upload_atomic_replace_failed")
+        else:
+            rn = _call_js("rename_path", {"old_path": tmp_contents, "new_path": contents},
+                          tab, 30, session_id) or {}
+            if not rn.get("ok"):
+                raise Bridge(f"upload_rename_failed: {rn.get('error')}")
+    except Exception:
+        try:
+            _call_js("delete_path", {"path": tmp_contents}, tab, 15, session_id)
+        except Exception:
+            pass
+        raise
+    after = _remote_stat(contents, session_id, tab)
+    if after["size"] != len(raw):
+        raise Bridge("upload_size_mismatch")
+    return {"ok": True, "path": server_path, "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(), "transport": "chunked_http"}
+
+
+def put_file(local, remote, overwrite=False, allow_large=False):
     """Upload one local file under the Contents root; no-clobber unless overwrite is explicit."""
     server_path, contents = _transfer_path(remote)
+    limit = MAX_CHUNKED_UPLOAD_BYTES if allow_large else MAX_UPLOAD_BYTES
     try:
         with open(local, "rb") as fh:
-            raw = fh.read(MAX_UPLOAD_BYTES + 1)
+            raw = fh.read(limit + 1)
     except OSError as exc:
         raise ValueError(f"local_file_read_failed: {exc}") from exc
-    if len(raw) > MAX_UPLOAD_BYTES:
-        raise ValueError(f"upload_too_large: limit {MAX_UPLOAD_BYTES} bytes")
+    if len(raw) > limit:
+        raise ValueError(f"upload_too_large: limit {limit} bytes")
+    if allow_large and len(raw) > MAX_UPLOAD_BYTES:
+        return _put_chunked_bytes(raw, remote, overwrite=overwrite)
     _write_bytes(server_path, raw, overwrite, "/data")
     after = _remote_stat(contents)
     if after["size"] != len(raw):
         raise Bridge("upload_size_mismatch")
     return {"ok": True, "path": server_path, "bytes": len(raw),
             "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+_SYNC_DEFAULT_EXCLUDES = (".git", "__pycache__", ".DS_Store", "*.pyc", ".sn-sync-*.tar.gz", "__sn_sync_*.tar.gz")
+
+
+def _build_sync_tar(local_dir, excludes=()):
+    root = os.path.abspath(local_dir)
+    if not os.path.isdir(root):
+        raise ValueError("local_dir_not_found")
+    patterns = tuple(_SYNC_DEFAULT_EXCLUDES) + tuple(excludes or ())
+    buf = io.BytesIO()
+    files = []
+    total_bytes = 0
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for base, dirs, names in os.walk(root, followlinks=False):
+            dirs[:] = sorted(
+                d for d in dirs
+                if not os.path.islink(os.path.join(base, d))
+                and not any(fnmatch.fnmatch(d, pat) for pat in patterns)
+            )
+            for name in sorted(names):
+                if any(fnmatch.fnmatch(name, pat) for pat in patterns):
+                    continue
+                full = os.path.join(base, name)
+                if os.path.islink(full) or not os.path.isfile(full):
+                    continue
+                rel = os.path.relpath(full, root).replace(os.sep, "/")
+                if any(fnmatch.fnmatch(rel, pat) for pat in patterns):
+                    continue
+                st = os.lstat(full)
+                total_bytes += st.st_size
+                if total_bytes > MAX_CHUNKED_UPLOAD_BYTES * 2:
+                    raise ValueError(f"sync_dir_too_large: raw bytes exceed {MAX_CHUNKED_UPLOAD_BYTES * 2}")
+                tf.add(full, arcname=rel, recursive=False)
+                files.append({"path": rel, "size": st.st_size})
+    archive = buf.getvalue()
+    if len(archive) > MAX_CHUNKED_UPLOAD_BYTES:
+        raise ValueError(f"sync_archive_too_large: limit {MAX_CHUNKED_UPLOAD_BYTES} bytes")
+    return archive, files, total_bytes
+
+
+def sync_up(local_dir, remote_dir, excludes=(), chmod_scripts=True):
+    """Bundle a local directory safely, upload atomically, and extract on the server."""
+    server_dir, contents_dir = _transfer_path(remote_dir)
+    if server_dir != WORK_ROOT and not server_dir.startswith(WORK_ROOT + "/"):
+        raise ValueError("sync_remote_must_be_under_work_root")
+    archive, files, total_bytes = _build_sync_tar(local_dir, excludes=excludes)
+    archive_sha = hashlib.sha256(archive).hexdigest()
+    tmp_name = f"__sn_sync_{uuid.uuid4().hex}.tar.gz"
+    tmp_remote = f"{contents_dir}/{tmp_name}" if contents_dir else tmp_name
+    tmp_server = posixpath.join(server_dir, tmp_name)
+    _put_chunked_bytes(archive, tmp_remote, overwrite=True)
+    extract_code = f'''import hashlib, json, os, stat, tarfile
+dst = os.path.realpath({server_dir!r}) if os.path.exists({server_dir!r}) else {server_dir!r}
+os.makedirs(dst, mode=0o700, exist_ok=True)
+dst = os.path.realpath(dst)
+arc = {tmp_server!r}
+expected_sha = {archive_sha!r}
+chmod_sh = {bool(chmod_scripts)!r}
+h = hashlib.sha256()
+with open(arc, 'rb') as fh:
+    for blk in iter(lambda: fh.read(1048576), b''):
+        h.update(blk)
+if h.hexdigest() != expected_sha:
+    os.unlink(arc)
+    raise ValueError('sync_archive_sha256_mismatch')
+extracted = 0
+try:
+    with tarfile.open(arc, 'r:gz') as tf:
+        for m in tf.getmembers():
+            if not (m.isfile() or m.isdir()):
+                raise ValueError('unsafe_tar_member:' + m.name)
+            norm = os.path.normpath(m.name)
+            if os.path.isabs(norm) or norm.startswith('..'):
+                raise ValueError('unsafe_tar_path:' + m.name)
+            target = os.path.realpath(os.path.join(dst, norm))
+            if os.path.commonpath((dst, target)) != dst:
+                raise ValueError('tar_escape:' + m.name)
+            if m.isdir():
+                os.makedirs(target, mode=0o700, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+                src_fh = tf.extractfile(m)
+                tmp_f = target + '.sn.tmp'
+                with open(tmp_f, 'wb') as out_fh:
+                    out_fh.write(src_fh.read())
+                mode = 0o700 if (chmod_sh and target.endswith('.sh')) else (0o700 if (m.mode & 0o111) else 0o600)
+                os.chmod(tmp_f, mode)
+                os.replace(tmp_f, target)
+                extracted += 1
+finally:
+    if os.path.exists(arc):
+        os.unlink(arc)
+print('SYNC_JSON=' + json.dumps({{'ok': True, 'extracted': extracted, 'remote_dir': dst}}))
+'''
+    res = run_python(extract_code, timeout=MAX_SYNC_SECONDS)
+    parsed = _pull_json((res.get("data") or {}).get("stdout"), marker="SYNC_JSON=")
+    if not parsed or not parsed.get("ok"):
+        raise Bridge("sync_up_extract_failed: " + str((res.get("data") or {}).get("stderr") or "")[:200])
+    return {
+        "ok": True,
+        "remote_dir": server_dir,
+        "file_count": len(files),
+        "extracted": parsed.get("extracted"),
+        "total_bytes": total_bytes,
+        "archive_bytes": len(archive),
+        "archive_sha256": archive_sha,
+    }
+
+
+def sync_down(remote_dir, out_dir, glob_patterns="*", overwrite=False, verify=True,
+              max_files=100, skip_existing=False):
+    """Download matching files from a remote directory tree under /data into a local folder."""
+    server_dir, contents_dir = _transfer_path(remote_dir)
+    max_files = _validate_bounded_int(max_files, 1, 500, "invalid_max_files")
+    pats = [p.strip() for p in str(glob_patterns or "*").split(",") if p.strip()] or ["*"]
+    walk_code = f'''import fnmatch, json, os, stat
+root = os.path.realpath({server_dir!r})
+pats = {pats!r}
+limit = {max_files!r}
+items = []
+truncated = False
+if not os.path.isdir(root):
+    print('WALK_JSON=' + json.dumps({{'ok': False, 'error': 'remote_dir_not_found'}}))
+else:
+    for base, dirs, names in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(base, d)))
+        for name in sorted(names):
+            full = os.path.join(base, name)
+            try:
+                info = os.lstat(full)
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+            except OSError:
+                continue
+            rel = os.path.relpath(full, root).replace(os.sep, '/')
+            if any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p) for p in pats):
+                if len(items) >= limit:
+                    truncated = True
+                    break
+                items.append({{'rel': rel, 'size': info.st_size}})
+        if truncated:
+            break
+    print('WALK_JSON=' + json.dumps({{'ok': True, 'files': items, 'truncated': truncated}}))
+'''
+    res = run_python(walk_code, timeout=MAX_SYNC_SECONDS)
+    listing = _pull_json((res.get("data") or {}).get("stdout"), marker="WALK_JSON=")
+    if not listing or not listing.get("ok"):
+        raise Bridge(f"sync_down_list_failed: {(listing or {}).get('error') or 'unknown'}")
+    out_root = os.path.abspath(out_dir)
+    os.makedirs(out_root, exist_ok=True)
+    downloaded, skipped, failed = [], [], []
+    total_bytes = 0
+    for item in listing.get("files", []):
+        rel = item["rel"]
+        if rel.startswith("/") or ".." in rel.split("/"):
+            continue
+        local_dst = os.path.join(out_root, *rel.split("/"))
+        remote_src = f"{contents_dir}/{rel}" if contents_dir else rel
+        if skip_existing and os.path.isfile(local_dst) and os.path.getsize(local_dst) == item["size"]:
+            skipped.append({"rel": rel, "bytes": item["size"]})
+            continue
+        try:
+            r = get_file(remote_src, local_dst, overwrite=overwrite, verify=verify)
+            total_bytes += int(r.get("bytes") or 0)
+            downloaded.append({"rel": rel, "bytes": r.get("bytes"), "sha256": r.get("sha256")})
+        except (Bridge, ValueError, OSError) as exc:
+            failed.append({"rel": rel, "error": str(exc)[:200]})
+    return {
+        "ok": len(failed) == 0,
+        "remote_dir": server_dir,
+        "out_dir": out_root,
+        "matched": len(listing.get("files", [])),
+        "truncated": bool(listing.get("truncated")),
+        "downloaded": len(downloaded),
+        "skipped": len(skipped),
+        "failed": len(failed),
+        "total_bytes": total_bytes,
+        "files": downloaded,
+        "errors": failed,
+    }
+
+
+_HOST_HEALTH_PY = r'''import json, os, shutil, socket, tempfile, time
+info = {"hostname": socket.gethostname(), "physical_cpus": os.cpu_count() or 1}
+try:
+    la = os.getloadavg()
+    info["loadavg"] = {"1m": round(la[0], 2), "5m": round(la[1], 2), "15m": round(la[2], 2)}
+    info["load_per_cpu"] = round(la[0] / max(1, info["physical_cpus"]), 2)
+except OSError:
+    info["loadavg"] = None
+    info["load_per_cpu"] = None
+
+def read_txt(p):
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+# cgroup CPU quota (v2 then v1)
+cg_cpu = None
+v2 = read_txt("/sys/fs/cgroup/cpu.max")
+if v2:
+    parts = v2.split()
+    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and int(parts[1]) > 0:
+        cg_cpu = round(int(parts[0]) / int(parts[1]), 2)
+else:
+    q = read_txt("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    p = read_txt("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if q and p and q.lstrip("-").isdigit() and p.isdigit() and int(q) > 0 and int(p) > 0:
+        cg_cpu = round(int(q) / int(p), 2)
+info["cgroup_cpu_quota"] = cg_cpu
+
+mem = {}
+mi = read_txt("/proc/meminfo") or ""
+for line in mi.splitlines():
+    for key in ("MemTotal:", "MemAvailable:"):
+        if line.startswith(key):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                mem[key[:-1]] = round(int(parts[1]) / (1024 * 1024), 1)
+info["mem_total_gb"] = mem.get("MemTotal")
+info["mem_avail_gb"] = mem.get("MemAvailable")
+
+for label, path in (("tmp", "/tmp"), ("work", "/data/work")):
+    try:
+        du = shutil.disk_usage(path)
+        info[f"disk_{label}_free_gb"] = round(du.free / (1024 ** 3), 1)
+    except OSError:
+        info[f"disk_{label}_free_gb"] = None
+
+def bench_write(directory, mb=16):
+    t0 = time.monotonic()
+    fd, path = tempfile.mkstemp(prefix=".sn-bench-", dir=directory)
+    try:
+        chunk = b"\0" * (1024 * 1024)
+        for _ in range(mb):
+            os.write(fd, chunk)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    dt = max(0.001, time.monotonic() - t0)
+    return round(mb / dt, 1)
+
+for label, path in (("tmp", "/tmp"), ("work", "/data/work")):
+    try:
+        info[f"write_mb_s_{label}"] = bench_write(path, 16)
+    except OSError:
+        info[f"write_mb_s_{label}"] = None
+
+lpc = info.get("load_per_cpu")
+if lpc is not None and lpc >= 1.5:
+    info["recommendation"] = "use_offline_dedicated_node"
+    info["note"] = "Shared host CPU is heavily oversubscribed (load/cpu >= 1.5); use StereoNote for setup/sync/light checks and submit heavy multi-sample compute to dedicated offline nodes."
+elif lpc is not None and lpc >= 0.9:
+    info["recommendation"] = "moderate_load_limit_concurrency"
+    info["note"] = "Shared host has moderate load; cap --max-concurrent and pin --threads."
+else:
+    info["recommendation"] = "healthy_interactive"
+    info["note"] = "Host load looks healthy for interactive and small-batch runs."
+
+print("HEALTH_JSON=" + json.dumps(info, separators=(",", ":")))
+'''
+
+
+def host_health(timeout=MAX_SYNC_SECONDS):
+    """Inspect server CPU/cgroup/load/memory/disk and recommend interactive vs offline compute."""
+    res = run_python(_HOST_HEALTH_PY, timeout=min(timeout, MAX_SYNC_SECONDS))
+    parsed = _pull_json((res.get("data") or {}).get("stdout"), marker="HEALTH_JSON=")
+    if not parsed:
+        return {"ok": False, "error": "host_health_failed",
+                "stderr": str((res.get("data") or {}).get("stderr") or "")[:MAX_INSPECT_VALUE_CHARS]}
+    parsed["ok"] = True
+    return parsed
 
 
 # ─────────────────────────── path helpers ───────────────────────────
@@ -1285,7 +1813,7 @@ def _wait_for_runner_ready(job_id, timeout):
 
 
 def submit(cmd, name=None, cwd=None, timeout=MAX_SYNC_SECONDS, readiness_timeout=5.0,
-           idempotency_key=None):
+           idempotency_key=None, threads=None, local_tmp=False, batch_id=None, sample_id=None):
     """Submit a raw shell command; its payload is intentionally not OS-sandboxed.
 
     Controller-created state is restricted to ``/data/work/agent_jobs``. The
@@ -1299,7 +1827,16 @@ def submit(cmd, name=None, cwd=None, timeout=MAX_SYNC_SECONDS, readiness_timeout
     command_sha = hashlib.sha256(cmd.encode("utf-8")).hexdigest()
     identity = {"project_id": project_id, "workspace_id": workspace_id,
                 "cwd": execution_cwd, "command_sha256": command_sha}
-    launcher = build_job_launcher(jid, cmd, cwd=cwd)
+    launcher_kwargs = {"cwd": cwd}
+    if threads is not None:
+        launcher_kwargs["threads"] = threads
+    if local_tmp:
+        launcher_kwargs["local_tmp"] = True
+    if batch_id:
+        launcher_kwargs["batch_id"] = batch_id
+    if sample_id:
+        launcher_kwargs["sample_id"] = sample_id
+    launcher = build_job_launcher(jid, cmd, **launcher_kwargs)
     try:
         _write_receipt(jid, "pending", exclusive=True, **identity)
     except FileExistsError:
@@ -1353,8 +1890,126 @@ def _poll_section(raw, frame, section):
     return ("ok", value)
 
 
-def poll(job_id, tail=40):
+def _tail_lines(text, count):
+    if not text:
+        return ""
+    lines = text.splitlines(keepends=True)
+    return "".join(lines[-count:]) if len(lines) > count else text
+
+
+def _parse_heartbeat_age(hb_obj):
+    if not isinstance(hb_obj, dict):
+        return None
+    epoch = hb_obj.get("epoch")
+    if isinstance(epoch, (int, float)) and not isinstance(epoch, bool):
+        return max(0, int(time.time() - epoch))
+    return None
+
+
+def poll_http(job_id, tail=40):
+    """Kernel-free pure-HTTP poll via batch_http + HTTP Range log tails.
+
+    Because no kernel is invoked, this remains fast even under extreme host CPU
+    load, while honestly reporting `process='http_unverified'` and heartbeat age
+    for running jobs instead of claiming PID liveness.
+    """
+    job_id = validate_job_id(job_id)
+    tail = validate_tail(tail)
+    jcontents = to_contents(f"{JOB_ROOT}/{job_id}")
+    reqs = [
+        {"id": "status", "kind": "read", "path": f"{jcontents}/status.json", "max_bytes": MAX_STATUS_BYTES},
+        {"id": "stage", "kind": "read", "path": f"{jcontents}/stage.json", "max_bytes": MAX_STATUS_BYTES},
+        {"id": "heartbeat", "kind": "read", "path": f"{jcontents}/heartbeat.json", "max_bytes": MAX_STATUS_BYTES},
+        {"id": "stdout", "kind": "read_range", "path": f"{jcontents}/stdout.log", "mode": "tail", "max_bytes": MAX_LOG_BYTES},
+        {"id": "stderr", "kind": "read_range", "path": f"{jcontents}/stderr.log", "mode": "tail", "max_bytes": MAX_LOG_BYTES},
+    ]
+    res = evaluate_op("batch_http", {"requests": reqs}, timeout=30)
+    results = (res.get("data") or {}).get("results") or {}
+    errors = {}
+    missing = {}
+
+    status = None
+    st_rec = results.get("status") or {}
+    if st_rec.get("ok") and isinstance(st_rec.get("content"), str):
+        missing["status"] = False
+        try:
+            parsed = json.loads(st_rec["content"])
+            status = parsed if isinstance(parsed, dict) else None
+            if status is None:
+                errors["status"] = "status_parse_error"
+        except (TypeError, ValueError):
+            errors["status"] = "status_parse_error"
+    elif st_rec.get("status") == 404:
+        missing["status"] = True
+    else:
+        missing["status"] = False
+        errors["status"] = str(st_rec.get("error") or "status_read_error")
+
+    stage = None
+    stage_rec = results.get("stage") or {}
+    if stage_rec.get("ok") and isinstance(stage_rec.get("content"), str):
+        try:
+            parsed = json.loads(stage_rec["content"])
+            if isinstance(parsed, dict):
+                stage = parsed
+        except (TypeError, ValueError):
+            pass
+
+    hb = None
+    hb_rec = results.get("heartbeat") or {}
+    if hb_rec.get("ok") and isinstance(hb_rec.get("content"), str):
+        try:
+            parsed = json.loads(hb_rec["content"])
+            if isinstance(parsed, dict):
+                hb = parsed
+        except (TypeError, ValueError):
+            pass
+
+    tails = {}
+    for key in ("stdout", "stderr"):
+        rec = results.get(key) or {}
+        if rec.get("ok") and isinstance(rec.get("text"), str):
+            missing[key] = False
+            tails[key] = _tail_lines(rec["text"], tail)
+        elif rec.get("status") == 404 or rec.get("error") == "not_found":
+            missing[key] = True
+            tails[key] = ""
+        else:
+            missing[key] = False
+            tails[key] = ""
+            errors[key] = str(rec.get("error") or f"{key}_read_error")
+
+    job_present = not (missing.get("status") and missing.get("stdout") and missing.get("stderr"))
+    missing["dir"] = not job_present
+    missing["live"] = False
+    receipt = _read_receipt(job_id)
+    local_state = (receipt or {}).get("state")
+    if status is not None:
+        raw_state = status.get("state") or "unknown"
+        outcome = "running_unverified" if raw_state == "running" else raw_state
+    elif job_present:
+        outcome = "starting"
+    elif local_state in ("pending", "setup_failed"):
+        outcome = "not_dispatched"
+    else:
+        outcome = "unknown"
+    pid = status.get("pid") if isinstance(status, dict) else None
+    out = {
+        "job_id": job_id, "tail": tail, "mode": "http_lite",
+        "status": status, "stage": stage,
+        "heartbeat_age_sec": _parse_heartbeat_age(hb),
+        "stdout_tail": tails["stdout"], "stderr_tail": tails["stderr"],
+        "missing": missing, "read_errors": errors,
+        "job_dir_present": job_present, "local_state": local_state,
+        "outcome": outcome, "process": "http_unverified", "pid": pid,
+    }
+    return out
+
+
+def poll(job_id, tail=40, lite=False):
     """Return durable state and bounded log tails as structured controller data."""
+    if lite:
+        return poll_http(job_id, tail=tail)
     job_id = validate_job_id(job_id)
     tail = validate_tail(tail)
     jdir = shlex.quote(f"{JOB_ROOT}/{job_id}")
@@ -1606,6 +2261,7 @@ root = %(root)r
 cutoff = time.time() - %(days)d * 86400
 dry_run = %(dry)r
 job_pattern = re.compile(%(job_pattern)r)
+batch_filter = %(batch_filter)r
 result = {'ok': True, 'removed': 0, 'eligible': 0, 'skipped': 0,
           'freed_bytes': None, 'job_ids': [], 'job_ids_truncated': False, 'errors': []}
 
@@ -1634,6 +2290,8 @@ def eligible(path, name):
     if (not isinstance(status, dict) or not isinstance(manifest, dict) or
             status.get('job_id') != name or manifest.get('job_id') != name or
             status.get('state') != 'finished'):
+        return None
+    if batch_filter is not None and manifest.get('batch_id') != batch_filter:
         return None
     ended = datetime.datetime.strptime(status['ended_at'], '%%Y-%%m-%%dT%%H:%%M:%%SZ')
     if ended.replace(tzinfo=datetime.timezone.utc).timestamp() >= cutoff:
@@ -1688,12 +2346,14 @@ print('PRUNE_JSON=' + json.dumps(result, separators=(',', ':')))
 '''
 
 
-def prune_jobs(days=7, dry_run=False):
+def prune_jobs(days=7, dry_run=False, batch_id=None):
     """Delete finished job directories older than `days`, never a live owner."""
     if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 3650:
         raise ValueError("invalid_days: use 1-3650")
+    if batch_id is not None:
+        batch_id = validate_batch_id(batch_id)
     code = _PRUNE_JOBS % {"root": JOB_ROOT, "days": days, "dry": bool(dry_run),
-                          "job_pattern": _JOB_ID_RE.pattern}
+                          "job_pattern": _JOB_ID_RE.pattern, "batch_filter": batch_id}
     cmd = "python3 -c " + shlex.quote(code)
     res = run_shell(cmd, cwd=WORK_ROOT, timeout=MAX_SYNC_SECONDS,
                     max_bytes=MAX_INTERNAL_SHELL_BYTES)
@@ -1712,7 +2372,612 @@ def prune_jobs(days=7, dry_run=False):
     if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
         return {"ok": False, "error": "prune_protocol_error"}
     result.update(days=days, dry_run=bool(dry_run), root=JOB_ROOT)
+    if batch_id is not None:
+        result["batch_id"] = batch_id
     return result
+
+
+# ─────────────────────────── server-side batch queue engine ───────────────────────────
+_BATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SAMPLE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_TEMPLATE_KEY_RE = re.compile(r"\{([A-Za-z0-9_.-]+)\}")
+MAX_BATCH_SAMPLES = 500
+
+
+def validate_batch_id(value):
+    if not isinstance(value, str) or not _BATCH_ID_RE.fullmatch(value):
+        raise ValueError("invalid_batch_id: use [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+    return value
+
+
+def validate_sample_id(value):
+    if not isinstance(value, str) or not _SAMPLE_ID_RE.fullmatch(value):
+        raise ValueError(f"invalid_sample_id: {value!r}")
+    return value
+
+
+def parse_batch_manifest(manifest_path, cmd_template):
+    """Parse a local TSV/CSV/JSON sample manifest and safely render shell commands."""
+    raw = read_local_text(manifest_path, MAX_WRITE_BYTES, "manifest_too_large")
+    ext = os.path.splitext(manifest_path)[1].lower()
+    if ext == ".json":
+        try:
+            rows = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError(f"invalid_manifest_json: {exc}") from exc
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            raise ValueError("manifest_json_must_be_list_of_objects")
+    else:
+        delimiter = "," if ext == ".csv" else "\t"
+        reader = csv.DictReader(io.StringIO(raw), delimiter=delimiter)
+        if not reader.fieldnames:
+            raise ValueError("manifest_missing_header")
+        rows = [dict(r) for r in reader if any(str(v or "").strip() for v in r.values())]
+    if not rows:
+        raise ValueError("manifest_empty")
+    if len(rows) > MAX_BATCH_SAMPLES:
+        raise ValueError(f"manifest_too_many_samples: limit {MAX_BATCH_SAMPLES}")
+    needed_keys = _TEMPLATE_KEY_RE.findall(cmd_template)
+    seen = set()
+    samples = []
+    for idx, row in enumerate(rows):
+        clean = {str(k).strip(): ("" if v is None else str(v).strip()) for k, v in row.items() if k is not None}
+        sid = clean.get("sample_id") or clean.get("sample") or clean.get("id")
+        if not sid:
+            raise ValueError(f"manifest_row_{idx + 1}_missing_sample_id")
+        sid = validate_sample_id(sid)
+        if sid in seen:
+            raise ValueError(f"duplicate_sample_id: {sid}")
+        seen.add(sid)
+        clean["sample_id"] = sid
+        missing_keys = [k for k in needed_keys if k not in clean]
+        if missing_keys:
+            raise ValueError(f"manifest_missing_template_keys: {','.join(missing_keys)}")
+        rendered = _TEMPLATE_KEY_RE.sub(lambda m: shlex.quote(clean[m.group(1)]), cmd_template)
+        validate_text_payload(rendered, MAX_COMMAND_BYTES, "rendered_command_too_large")
+        samples.append({"sample_id": sid, "cmd": rendered, "row": clean})
+    return samples
+
+
+def _make_sample_job_id(batch_id, sample_id, attempt):
+    identity = json.dumps([*_workspace_ids(WORKSPACE_URL), "batch", batch_id, sample_id, int(attempt)])
+    return f"job_{uuid.uuid5(uuid.NAMESPACE_URL, 'stereonote-batch:' + identity)}"
+
+
+_BATCH_DAEMON_PY = r'''#!/usr/bin/env python3
+"""Server-side detached batch queue daemon for Orange Note v5."""
+import hashlib, json, os, shlex, signal, stat, subprocess, sys, time
+
+BATCH_DIR = sys.argv[1]
+JOB_ROOT = sys.argv[2]
+CONTROLLER_JOB_ID = sys.argv[3]
+MANIFEST_PATH = os.path.join(BATCH_DIR, "batch_manifest.json")
+STATUS_PATH = os.path.join(BATCH_DIR, "batch_status.json")
+SAMPLES_DIR = os.path.join(BATCH_DIR, "samples")
+os.makedirs(SAMPLES_DIR, mode=0o700, exist_ok=True)
+
+
+def utc_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def atomic_write_json(path, obj):
+    tmp = path + ".tmp." + str(os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            v = json.load(fh)
+        return v if isinstance(v, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def make_sample_runner(job_id, command, cwd, batch_id, sample_id, threads, local_tmp):
+    jdir = os.path.join(JOB_ROOT, job_id)
+    os.makedirs(os.path.join(jdir, "artifacts"), mode=0o700, exist_ok=True)
+    os.chmod(jdir, 0o700)
+    for fn in ("stdout.log", "stderr.log"):
+        p = os.path.join(jdir, fn)
+        with open(p, "wb"):
+            pass
+        os.chmod(p, 0o600)
+    manifest = {
+        "schema_version": 2, "job_id": job_id, "command": command, "cwd": cwd,
+        "batch_id": batch_id, "sample_id": sample_id,
+    }
+    if threads is not None:
+        manifest["threads"] = threads
+    if local_tmp:
+        manifest["local_tmp"] = True
+    atomic_write_json(os.path.join(jdir, "manifest.json"), manifest)
+    atomic_write_json(os.path.join(jdir, "status.json"), {"state": "queued", "job_id": job_id})
+    cmd_path = os.path.join(jdir, "cmd.sh")
+    with open(cmd_path, "w", encoding="utf-8") as fh:
+        fh.write(command + "\n")
+    os.chmod(cmd_path, 0o600)
+
+    qdir = shlex.quote(jdir)
+    qcwd = shlex.quote(cwd)
+    qjob = shlex.quote(json.dumps(job_id))
+    env_lines = []
+    if threads is not None:
+        env_lines.append(
+            f"export OPENBLAS_NUM_THREADS={threads} OMP_NUM_THREADS={threads} "
+            f"MKL_NUM_THREADS={threads} NUMEXPR_NUM_THREADS={threads}"
+        )
+    tmp_setup = ""
+    tmp_cleanup = ""
+    if local_tmp:
+        tdir = shlex.quote(f"/tmp/sn_job_{job_id}")
+        tmp_setup = f"mkdir -p {tdir} && chmod 700 {tdir}\nexport TMPDIR={tdir} SN_TMPDIR={tdir}"
+        tmp_cleanup = f"  rm -rf {tdir} 2>/dev/null || true"
+    env_block = "\n".join(x for x in (*env_lines, tmp_setup) if x)
+    runner = f"""#!/usr/bin/env bash
+set +e
+umask 077
+started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf '%s\\n' "$$" > {qdir}/pid.tmp.$$ && mv {qdir}/pid.tmp.$$ {qdir}/pid
+chmod 600 {qdir}/pid
+printf '{{"state":"running","job_id":%s,"pid":%s,"started_at":"%s"}}\\n' {qjob} "$$" "$started_at" > {qdir}/status.json.tmp.$$
+mv {qdir}/status.json.tmp.$$ {qdir}/status.json
+chmod 600 {qdir}/status.json
+printf '{{"job_id":%s,"pid":%s,"ts":"%s","epoch":%s}}\\n' {qjob} "$$" "$started_at" "$(date -u +%s)" > {qdir}/heartbeat.json.tmp.$$
+mv {qdir}/heartbeat.json.tmp.$$ {qdir}/heartbeat.json
+chmod 600 {qdir}/heartbeat.json
+sn_stage() {{
+  local _s="${{1:-unknown}}" _d="${{2:-}}" _t="${{3:-}}" _n="${{4:-}}"
+  python3 -c 'import json, os, sys, time
+p, s, d, t, n = sys.argv[1:6]
+obj = {{"stage": s, "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}
+if d.isdigit(): obj["done"] = int(d)
+if t.isdigit(): obj["total"] = int(t)
+if n: obj["note"] = n[:256]
+tmp = p + ".tmp." + str(os.getpid())
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(obj, fh, ensure_ascii=False); fh.write("\\n")
+os.chmod(tmp, 0o600); os.replace(tmp, p)' {qdir}/stage.json "$_s" "$_d" "$_t" "$_n" 2>/dev/null || true
+}}
+export -f sn_stage
+_SN_HB_PID=""
+(
+  _sp=""
+  trap '[ -n "$_sp" ] && kill "$_sp" 2>/dev/null || true; exit 0' TERM INT
+  while true; do
+    sleep 60 &
+    _sp=$!
+    wait "$_sp" 2>/dev/null || break
+    _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    _ep=$(date -u +%s)
+    printf '{{"job_id":%s,"pid":%s,"ts":"%s","epoch":%s}}\\n' {qjob} "$$" "$_now" "$_ep" > {qdir}/heartbeat.json.tmp.$$ 2>/dev/null && mv {qdir}/heartbeat.json.tmp.$$ {qdir}/heartbeat.json 2>/dev/null || true
+  done
+) </dev/null >/dev/null 2>&1 &
+_SN_HB_PID=$!
+finalize() {{
+  rc=$?
+  trap - EXIT TERM INT
+  if [ -n "$_SN_HB_PID" ]; then kill "$_SN_HB_PID" 2>/dev/null || true; wait "$_SN_HB_PID" 2>/dev/null || true; fi
+{tmp_cleanup}
+  ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '%s\\n' "$ended_at" > {qdir}/ended_at.tmp.$$ && mv {qdir}/ended_at.tmp.$$ {qdir}/ended_at
+  printf '%s\\n' "$rc" > {qdir}/exit_code.tmp.$$ && mv {qdir}/exit_code.tmp.$$ {qdir}/exit_code
+  printf '{{"state":"finished","job_id":%s,"pid":%s,"started_at":"%s","ended_at":"%s","exit_code":%s}}\\n' {qjob} "$$" "$started_at" "$ended_at" "$rc" > {qdir}/status.json.tmp.$$
+  mv {qdir}/status.json.tmp.$$ {qdir}/status.json
+  chmod 600 {qdir}/status.json {qdir}/ended_at {qdir}/exit_code
+  exit "$rc"
+}}
+trap finalize EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+export SN_JOB_DIR={qdir}
+export SN_ARTIFACT_DIR={qdir}/artifacts
+export SN_BATCH_ID={shlex.quote(batch_id)}
+export SN_SAMPLE_ID={shlex.quote(sample_id)}
+{env_block}
+cd {qcwd} || exit 72
+bash {qdir}/cmd.sh > {qdir}/stdout.log 2> {qdir}/stderr.log
+"""
+    runner_path = os.path.join(jdir, "runner.sh")
+    with open(runner_path, "w", encoding="utf-8") as fh:
+        fh.write(runner)
+    os.chmod(runner_path, 0o700)
+    return jdir, runner_path
+
+
+manifest = read_json(MANIFEST_PATH)
+if not manifest:
+    sys.stderr.write("batch_manifest_missing\n")
+    sys.exit(2)
+
+batch_id = manifest["batch_id"]
+cwd = manifest["cwd"]
+max_concurrent = max(1, int(manifest.get("max_concurrent") or 1))
+threads = manifest.get("threads")
+local_tmp = bool(manifest.get("local_tmp"))
+generation = int(manifest.get("generation") or 1)
+
+prev_status = read_json(STATUS_PATH) or {}
+prev_samples = prev_status.get("samples") if isinstance(prev_status.get("samples"), dict) else {}
+
+sample_states = {}
+queue = []
+for item in manifest.get("samples", []):
+    sid = item["sample_id"]
+    old = prev_samples.get(sid) or {}
+    if old.get("state") == "finished" and old.get("exit_code") == 0 and not item.get("force_rerun"):
+        sample_states[sid] = dict(old)
+    else:
+        sample_states[sid] = {
+            "sample_id": sid,
+            "job_id": item["job_id"],
+            "attempt": int(item.get("attempt") or 1),
+            "state": "queued",
+            "exit_code": None,
+            "started_at": None,
+            "ended_at": None,
+            "stage": None,
+        }
+        queue.append(item)
+
+stop_requested = False
+
+
+def on_signal(signum, frame):
+    global stop_requested
+    stop_requested = True
+
+
+signal.signal(signal.SIGTERM, on_signal)
+signal.signal(signal.SIGINT, on_signal)
+
+active = {}  # sid -> (Popen, jdir, item)
+
+
+def publish(batch_state):
+    counts = {"total": len(sample_states), "queued": 0, "running": 0,
+              "finished": 0, "failed": 0, "cancelled": 0}
+    for sid, st in sample_states.items():
+        if st["state"] == "running":
+            stage = read_json(os.path.join(JOB_ROOT, st["job_id"], "stage.json"))
+            if stage:
+                st["stage"] = stage
+        bucket = st["state"] if st["state"] in counts else "failed"
+        counts[bucket] += 1
+        atomic_write_json(os.path.join(SAMPLES_DIR, f"{sid}.json"), st)
+    payload = {
+        "schema_version": 1,
+        "batch_id": batch_id,
+        "generation": generation,
+        "controller_job_id": CONTROLLER_JOB_ID,
+        "state": batch_state,
+        "max_concurrent": max_concurrent,
+        "updated_at": utc_now(),
+        "counts": counts,
+        "samples": sample_states,
+    }
+    atomic_write_json(STATUS_PATH, payload)
+    return counts
+
+
+publish("running")
+
+while queue or active:
+    if stop_requested:
+        for sid, (proc, jdir, item) in list(active.items()):
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+        deadline = time.monotonic() + 8.0
+        while active and time.monotonic() < deadline:
+            for sid, (proc, jdir, item) in list(active.items()):
+                rc = proc.poll()
+                if rc is not None:
+                    active.pop(sid, None)
+                    sample_states[sid]["state"] = "cancelled"
+                    sample_states[sid]["exit_code"] = rc
+                    sample_states[sid]["ended_at"] = utc_now()
+            if active:
+                time.sleep(0.25)
+        for sid, (proc, jdir, item) in list(active.items()):
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            sample_states[sid]["state"] = "cancelled"
+            sample_states[sid]["ended_at"] = utc_now()
+        active.clear()
+        for item in queue:
+            sid = item["sample_id"]
+            sample_states[sid]["state"] = "cancelled"
+            sample_states[sid]["ended_at"] = utc_now()
+        queue.clear()
+        publish("cancelled")
+        sys.exit(143)
+
+    for sid, (proc, jdir, item) in list(active.items()):
+        rc = proc.poll()
+        if rc is not None:
+            active.pop(sid, None)
+            st = sample_states[sid]
+            st["exit_code"] = rc
+            st["ended_at"] = utc_now()
+            st["state"] = "finished" if rc == 0 else "failed"
+            stage = read_json(os.path.join(jdir, "stage.json"))
+            if stage:
+                st["stage"] = stage
+
+    while queue and len(active) < max_concurrent and not stop_requested:
+        item = queue.pop(0)
+        sid = item["sample_id"]
+        jdir, runner_path = make_sample_runner(
+            item["job_id"], item["cmd"], cwd, batch_id, sid, threads, local_tmp
+        )
+        launcher_log = open(os.path.join(jdir, "launcher.log"), "ab")
+        proc = subprocess.Popen(
+            ["bash", runner_path],
+            stdin=subprocess.DEVNULL,
+            stdout=launcher_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        launcher_log.close()
+        sample_states[sid]["state"] = "running"
+        sample_states[sid]["started_at"] = utc_now()
+        sample_states[sid]["pid"] = proc.pid
+        active[sid] = (proc, jdir, item)
+
+    publish("running")
+    if queue or active:
+        time.sleep(1.5)
+
+counts = publish("finished")
+sys.exit(0 if counts["failed"] == 0 and counts["cancelled"] == 0 else 1)
+'''
+
+
+def _batch_dir(batch_id):
+    return f"{BATCH_ROOT}/{validate_batch_id(batch_id)}"
+
+
+def batch_submit(batch_id, manifest_path, cmd_template, cwd=None, max_concurrent=2,
+                 threads=None, local_tmp=False):
+    """Upload a manifest + server-side queue daemon and submit it as a detached job."""
+    batch_id = validate_batch_id(batch_id)
+    max_concurrent = _validate_bounded_int(max_concurrent, 1, 64, "invalid_max_concurrent")
+    if threads is not None:
+        threads = _validate_bounded_int(threads, 1, 256, "invalid_threads")
+    execution_cwd = to_server(cwd or WORK_ROOT)
+    samples = parse_batch_manifest(manifest_path, cmd_template)
+    bdir = _batch_dir(batch_id)
+    manifest_obj = {
+        "schema_version": 1,
+        "batch_id": batch_id,
+        "generation": 1,
+        "created_at": _utc_now(),
+        "cwd": execution_cwd,
+        "max_concurrent": max_concurrent,
+        "threads": threads,
+        "local_tmp": bool(local_tmp),
+        "cmd_template": cmd_template,
+        "samples": [
+            {
+                "sample_id": s["sample_id"],
+                "cmd": s["cmd"],
+                "attempt": 1,
+                "job_id": _make_sample_job_id(batch_id, s["sample_id"], 1),
+            }
+            for s in samples
+        ],
+    }
+    write_text(f"{bdir}/batch_manifest.json",
+               json.dumps(manifest_obj, ensure_ascii=False, indent=2) + "\n",
+               overwrite=False)
+    write_text(f"{bdir}/queue_daemon.py", _BATCH_DAEMON_PY, overwrite=True)
+    cmd = (
+        f"python3 {shlex.quote(bdir + '/queue_daemon.py')} "
+        f"{shlex.quote(bdir)} {shlex.quote(JOB_ROOT)} \"$SN_JOB_DIR\""
+    )
+    # Pass controller job_id (basename of SN_JOB_DIR) to daemon
+    cmd = (
+        f"python3 {shlex.quote(bdir + '/queue_daemon.py')} "
+        f"{shlex.quote(bdir)} {shlex.quote(JOB_ROOT)} \"$(basename \"$SN_JOB_DIR\")\""
+    )
+    job = submit(
+        cmd,
+        name="batch",
+        cwd=WORK_ROOT,
+        idempotency_key=f"batch:{batch_id}:gen1",
+        batch_id=batch_id,
+    )
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "generation": 1,
+        "batch_dir": bdir,
+        "controller_job_id": job["job_id"],
+        "reused": bool(job.get("reused")),
+        "max_concurrent": max_concurrent,
+        "sample_count": len(samples),
+        "samples": [{"sample_id": s["sample_id"], "job_id": s["job_id"]} for s in manifest_obj["samples"]],
+    }
+
+
+def batch_status(batch_id, include_logs=False, tail_bytes=2048):
+    """Kernel-free pure-HTTP batch dashboard (reads batch_status + failed logs in 1-2 HTTP ops)."""
+    batch_id = validate_batch_id(batch_id)
+    tail_bytes = _validate_bounded_int(tail_bytes, 256, MAX_LOG_BYTES, "invalid_tail_bytes")
+    bcontents = to_contents(_batch_dir(batch_id))
+    res = evaluate_op("read", {"path": f"{bcontents}/batch_status.json",
+                               "max_bytes": MAX_INSPECT_BYTES}, timeout=30)
+    data = res.get("data") or {}
+    if not data.get("ok") or not isinstance(data.get("content"), str):
+        return {"ok": False, "batch_id": batch_id, "error": "batch_status_not_found"}
+    try:
+        st = json.loads(data["content"])
+    except ValueError:
+        return {"ok": False, "batch_id": batch_id, "error": "batch_status_parse_error"}
+    controller_job_id = st.get("controller_job_id")
+    samples = st.get("samples") if isinstance(st.get("samples"), dict) else {}
+    reqs = []
+    if controller_job_id:
+        cj = to_contents(f"{JOB_ROOT}/{controller_job_id}")
+        reqs.append({"id": "__ctrl_status", "kind": "read", "path": f"{cj}/status.json", "max_bytes": MAX_STATUS_BYTES})
+        reqs.append({"id": "__ctrl_hb", "kind": "read", "path": f"{cj}/heartbeat.json", "max_bytes": MAX_STATUS_BYTES})
+    log_targets = []
+    for sid, info in samples.items():
+        if info.get("state") in ("failed", "cancelled") or (include_logs and info.get("state") == "running"):
+            if info.get("job_id") and len(log_targets) < 16:
+                log_targets.append((sid, info["job_id"]))
+                sj = to_contents(f"{JOB_ROOT}/{info['job_id']}")
+                reqs.append({"id": f"err:{sid}", "kind": "read_range",
+                             "path": f"{sj}/stderr.log", "mode": "tail", "max_bytes": tail_bytes})
+    ctrl_status = None
+    ctrl_hb_age = None
+    failed_stderr = {}
+    if reqs:
+        bres = evaluate_op("batch_http", {"requests": reqs}, timeout=30)
+        bmap = (bres.get("data") or {}).get("results") or {}
+        cs = bmap.get("__ctrl_status") or {}
+        if cs.get("ok") and isinstance(cs.get("content"), str):
+            try:
+                ctrl_status = json.loads(cs["content"])
+            except ValueError:
+                pass
+        chb = bmap.get("__ctrl_hb") or {}
+        if chb.get("ok") and isinstance(chb.get("content"), str):
+            try:
+                ctrl_hb_age = _parse_heartbeat_age(json.loads(chb["content"]))
+            except ValueError:
+                pass
+        for sid, _ in log_targets:
+            rec = bmap.get(f"err:{sid}") or {}
+            if rec.get("ok") and isinstance(rec.get("text"), str) and rec["text"].strip():
+                failed_stderr[sid] = rec["text"]
+
+    state = st.get("state") or "unknown"
+    if state == "running" and isinstance(ctrl_status, dict) and ctrl_status.get("state") == "finished":
+        # Avoid a 1-tick read race if the daemon finished between reading batch_status and ctrl_status.
+        reread = evaluate_op("read", {"path": f"{bcontents}/batch_status.json",
+                                      "max_bytes": MAX_INSPECT_BYTES}, timeout=15)
+        rdata = (reread or {}).get("data") or {}
+        if rdata.get("ok") and isinstance(rdata.get("content"), str):
+            try:
+                st2 = json.loads(rdata["content"])
+                if isinstance(st2, dict) and st2.get("state") != "running":
+                    st = st2
+                    state = st2.get("state") or state
+                    samples = st2.get("samples") if isinstance(st2.get("samples"), dict) else samples
+            except ValueError:
+                pass
+        if state == "running":
+            state = "stale_daemon"
+    counts = st.get("counts") or {}
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "generation": st.get("generation"),
+        "state": state,
+        "controller_job_id": controller_job_id,
+        "controller_state": (ctrl_status or {}).get("state"),
+        "controller_heartbeat_age_sec": ctrl_hb_age,
+        "max_concurrent": st.get("max_concurrent"),
+        "updated_at": st.get("updated_at"),
+        "counts": counts,
+        "samples": samples,
+        "stderr_tails": failed_stderr,
+    }
+
+
+def batch_retry_failed(batch_id, max_concurrent=None):
+    """Re-queue only failed/cancelled samples of an existing batch; skip finished samples."""
+    batch_id = validate_batch_id(batch_id)
+    bdir = _batch_dir(batch_id)
+    bcontents = to_contents(bdir)
+    bres = evaluate_op("batch_http", {"requests": [
+        {"id": "manifest", "kind": "read", "path": f"{bcontents}/batch_manifest.json", "max_bytes": MAX_INSPECT_BYTES},
+        {"id": "status", "kind": "read", "path": f"{bcontents}/batch_status.json", "max_bytes": MAX_INSPECT_BYTES},
+    ]}, timeout=30)
+    bmap = (bres.get("data") or {}).get("results") or {}
+    m_rec = bmap.get("manifest") or {}
+    s_rec = bmap.get("status") or {}
+    if not m_rec.get("ok") or not isinstance(m_rec.get("content"), str):
+        raise Bridge("batch_manifest_not_found")
+    manifest = json.loads(m_rec["content"])
+    status = json.loads(s_rec["content"]) if (s_rec.get("ok") and isinstance(s_rec.get("content"), str)) else {}
+    cur_samples = status.get("samples") if isinstance(status.get("samples"), dict) else {}
+    if status.get("state") == "running":
+        ctrl_id = status.get("controller_job_id")
+        if ctrl_id:
+            cp = poll_http(ctrl_id, tail=5)
+            if (cp.get("status") or {}).get("state") == "running" and (cp.get("heartbeat_age_sec") or 0) < 180:
+                raise Bridge(f"batch_still_running: controller_job_id={ctrl_id}")
+    retried = []
+    for item in manifest.get("samples", []):
+        sid = item["sample_id"]
+        st = cur_samples.get(sid) or {}
+        if st.get("state") == "finished" and st.get("exit_code") == 0:
+            item["force_rerun"] = False
+            continue
+        next_attempt = int(item.get("attempt") or 1) + 1
+        item["attempt"] = next_attempt
+        item["job_id"] = _make_sample_job_id(batch_id, sid, next_attempt)
+        item["force_rerun"] = True
+        retried.append({"sample_id": sid, "attempt": next_attempt, "job_id": item["job_id"]})
+    if not retried:
+        return {"ok": True, "batch_id": batch_id, "retried": 0, "note": "no_failed_samples"}
+    next_gen = int(manifest.get("generation") or 1) + 1
+    manifest["generation"] = next_gen
+    if max_concurrent is not None:
+        manifest["max_concurrent"] = _validate_bounded_int(max_concurrent, 1, 64, "invalid_max_concurrent")
+    write_text(f"{bdir}/batch_manifest.json",
+               json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+               overwrite=True)
+    write_text(f"{bdir}/queue_daemon.py", _BATCH_DAEMON_PY, overwrite=True)
+    cmd = (
+        f"python3 {shlex.quote(bdir + '/queue_daemon.py')} "
+        f"{shlex.quote(bdir)} {shlex.quote(JOB_ROOT)} \"$(basename \"$SN_JOB_DIR\")\""
+    )
+    job = submit(
+        cmd,
+        name="batch",
+        cwd=WORK_ROOT,
+        idempotency_key=f"batch:{batch_id}:gen{next_gen}",
+        batch_id=batch_id,
+    )
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "generation": next_gen,
+        "controller_job_id": job["job_id"],
+        "retried": len(retried),
+        "samples": retried,
+    }
+
+
+def batch_cancel(batch_id):
+    """Cancel a running batch queue daemon (forwards SIGTERM to active sample workers)."""
+    st = batch_status(batch_id)
+    if not st.get("ok"):
+        return st
+    ctrl_id = st.get("controller_job_id")
+    if not ctrl_id:
+        return {"ok": False, "batch_id": batch_id, "error": "missing_controller_job_id"}
+    res = cancel_job(ctrl_id)
+    res["batch_id"] = batch_id
+    return res
 
 
 _ARTIFACT_INVENTORY = r'''
@@ -1870,6 +3135,188 @@ out={"format":"parquet","path":p,"num_rows":int(f.metadata.num_rows),
 emit_summary(out)
 '''
 
+FASTQ_INSPECT = _INSPECT_PRELUDE + r'''
+import gzip, statistics
+p = safe_path(%(p)r)
+size_bytes = os.path.getsize(p)
+is_gz = p.lower().endswith(".gz")
+opener = (lambda path: gzip.open(path, "rt", encoding="ascii", errors="replace")) if is_gz else (lambda path: open(path, "r", encoding="ascii", errors="replace"))
+lengths, qmeans, ids = [], [], []
+with opener(p) as fh:
+    for _ in range(500):
+        h = fh.readline()
+        if not h: break
+        seq = fh.readline().strip()
+        fh.readline()
+        qual = fh.readline().strip()
+        if not seq: break
+        lengths.append(len(seq))
+        if len(ids) < 3:
+            ids.append(clip(h.strip().split()[0]))
+        if qual:
+            qmeans.append(sum(ord(c) - 33 for c in qual) / max(1, len(qual)))
+out = {
+    "format": "fastq", "path": p, "size_bytes": size_bytes, "compressed": is_gz,
+    "sampled_reads": len(lengths), "first_read_ids": ids,
+    "length_min": min(lengths) if lengths else None,
+    "length_median": int(statistics.median(lengths)) if lengths else None,
+    "length_mean": round(sum(lengths) / len(lengths), 1) if lengths else None,
+    "length_max": max(lengths) if lengths else None,
+    "mean_qscore": round(sum(qmeans) / len(qmeans), 2) if qmeans else None,
+}
+emit_summary(out)
+'''
+
+BAM_INSPECT = _INSPECT_PRELUDE + r'''
+import shutil, subprocess
+p = safe_path(%(p)r)
+size_bytes = os.path.getsize(p)
+has_bai = os.path.isfile(p + ".bai") or os.path.isfile(os.path.splitext(p)[0] + ".bai")
+out = {"format": "bam", "path": p, "size_bytes": size_bytes, "has_bai": has_bai}
+try:
+    import pysam
+    with pysam.AlignmentFile(p, "rb") as bam:
+        hdr = bam.header.to_dict()
+        out["n_references"] = len(hdr.get("SQ") or [])
+        out["first_refs"] = [clip(r.get("SN")) for r in (hdr.get("SQ") or [])[:10]]
+        out["programs"] = [clip(pg.get("ID") or pg.get("PN")) for pg in (hdr.get("PG") or [])[:10]]
+        out["read_groups"] = [clip(rg.get("ID")) for rg in (hdr.get("RG") or [])[:10]]
+        n = sec = supp = unm = 0
+        lens = []
+        for aln in bam.fetch(until_eof=True):
+            n += 1
+            if aln.is_unmapped: unm += 1
+            if aln.is_secondary: sec += 1
+            if aln.is_supplementary: supp += 1
+            if aln.query_length: lens.append(aln.query_length)
+            if n >= 2000: break
+        out.update({"sampled_records": n, "unmapped": unm, "secondary_0x100": sec,
+                    "supplementary_0x800": supp,
+                    "mean_query_len": round(sum(lens)/len(lens), 1) if lens else None,
+                    "backend": "pysam"})
+except Exception:
+    samtools = shutil.which("samtools")
+    if not samtools:
+        out["error"] = "pysam_and_samtools_unavailable"
+    else:
+        hdr = subprocess.run([samtools, "view", "-H", p], capture_output=True, text=True, timeout=20)
+        sq = [l.split("\t")[1].replace("SN:", "") for l in hdr.stdout.splitlines() if l.startswith("@SQ") and "\t" in l]
+        pg = [clip(l) for l in hdr.stdout.splitlines() if l.startswith("@PG")][:10]
+        out["n_references"] = len(sq)
+        out["first_refs"] = [clip(x) for x in sq[:10]]
+        out["programs"] = pg
+        proc = subprocess.Popen([samtools, "view", p], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        n = sec = supp = unm = 0
+        lens = []
+        try:
+            for line in proc.stdout:
+                parts = line.split("\t", 11)
+                if len(parts) < 10: continue
+                flag = int(parts[1])
+                n += 1
+                if flag & 4: unm += 1
+                if flag & 256: sec += 1
+                if flag & 2048: supp += 1
+                if parts[9] != "*": lens.append(len(parts[9]))
+                if n >= 2000: break
+        finally:
+            proc.terminate()
+            try: proc.wait(timeout=3)
+            except Exception: proc.kill()
+        out.update({"sampled_records": n, "unmapped": unm, "secondary_0x100": sec,
+                    "supplementary_0x800": supp,
+                    "mean_query_len": round(sum(lens)/len(lens), 1) if lens else None,
+                    "backend": "samtools"})
+emit_summary(out)
+'''
+
+GTF_INSPECT = _INSPECT_PRELUDE + r'''
+import gzip, re
+p = safe_path(%(p)r)
+size_bytes = os.path.getsize(p)
+is_gz = p.lower().endswith(".gz")
+opener = (lambda path: gzip.open(path, "rt", encoding="utf-8", errors="replace")) if is_gz else (lambda path: open(path, "r", encoding="utf-8", errors="replace"))
+comments, features, chroms, gene_ids = [], {}, [], []
+gid_re = re.compile(r'gene_id[ =]"?([^";\s]+)')
+n = 0
+with opener(p) as fh:
+    for line in fh:
+        if line.startswith("#"):
+            if len(comments) < 5: comments.append(clip(line.strip()))
+            continue
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 9: continue
+        n += 1
+        if len(chroms) < 5 and parts[0] not in chroms: chroms.append(clip(parts[0]))
+        features[parts[2]] = features.get(parts[2], 0) + 1
+        if len(gene_ids) < 5:
+            m = gid_re.search(parts[8])
+            if m and m.group(1) not in gene_ids: gene_ids.append(clip(m.group(1)))
+        if n >= 500: break
+out = {"format": "gtf_gff", "path": p, "size_bytes": size_bytes, "compressed": is_gz,
+       "sampled_records": n, "header_comments": comments, "sample_chroms": chroms,
+       "chrom_prefix_chr": any(c.startswith("chr") for c in chroms),
+       "feature_counts": {clip(k): v for k, v in list(features.items())[:20]},
+       "sample_gene_ids": gene_ids,
+       "gene_id_has_version": any("." in g for g in gene_ids)}
+emit_summary(out)
+'''
+
+PAF_INSPECT = _INSPECT_PRELUDE + r'''
+import gzip
+p = safe_path(%(p)r)
+size_bytes = os.path.getsize(p)
+is_gz = p.lower().endswith(".gz")
+opener = (lambda path: gzip.open(path, "rt", encoding="utf-8", errors="replace")) if is_gz else (lambda path: open(path, "r", encoding="utf-8", errors="replace"))
+n = 0; qlens, mapqs, targets = [], [], []
+with opener(p) as fh:
+    for line in fh:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 12: continue
+        n += 1
+        if parts[1].isdigit(): qlens.append(int(parts[1]))
+        if parts[11].isdigit(): mapqs.append(int(parts[11]))
+        if len(targets) < 5 and parts[5] not in targets: targets.append(clip(parts[5]))
+        if n >= 1000: break
+out = {"format": "paf", "path": p, "size_bytes": size_bytes, "compressed": is_gz,
+       "sampled_records": n,
+       "mean_query_len": round(sum(qlens)/len(qlens), 1) if qlens else None,
+       "mean_mapq": round(sum(mapqs)/len(mapqs), 1) if mapqs else None,
+       "sample_targets": targets}
+emit_summary(out)
+'''
+
+VCF_INSPECT = _INSPECT_PRELUDE + r'''
+import gzip
+p = safe_path(%(p)r)
+size_bytes = os.path.getsize(p)
+is_gz = p.lower().endswith(".gz")
+opener = (lambda path: gzip.open(path, "rt", encoding="utf-8", errors="replace")) if is_gz else (lambda path: open(path, "r", encoding="utf-8", errors="replace"))
+samples, chroms, filters = [], [], {}
+n_contigs = 0; n_rec = 0
+with opener(p) as fh:
+    for line in fh:
+        if line.startswith("##contig"):
+            n_contigs += 1; continue
+        if line.startswith("##"):
+            continue
+        if line.startswith("#CHROM"):
+            cols = line.rstrip("\n").split("\t")
+            samples = [clip(s) for s in cols[9:59]]
+            continue
+        parts = line.rstrip("\n").split("\t", 8)
+        if len(parts) < 7: continue
+        n_rec += 1
+        if len(chroms) < 10 and parts[0] not in chroms: chroms.append(clip(parts[0]))
+        filters[parts[6]] = filters.get(parts[6], 0) + 1
+        if n_rec >= 200: break
+out = {"format": "vcf", "path": p, "size_bytes": size_bytes, "compressed": is_gz,
+       "n_contigs": n_contigs, "sample_count_preview": len(samples), "samples": samples,
+       "sampled_variants": n_rec, "sample_chroms": chroms,
+       "filter_counts": {clip(k): v for k, v in list(filters.items())[:20]}}
+emit_summary(out)
+'''
+
 RDS_R = r'''
 MAX_ITEMS <- 100L; MAX_VALUE <- 256L; MAX_RESULT_BYTES <- __MAX_RESULT_BYTES__L
 clip <- function(x) substr(as.character(x), 1L, MAX_VALUE)
@@ -1980,14 +3427,71 @@ def list_path(path, timeout=MAX_SYNC_SECONDS, include_hidden=False):
     return listing
 
 
-def cat_path(path):
-    """Always use the bounded server-side text preview; never download full files."""
-    return inspect_text(path, max_bytes=DEFAULT_TEXT_PREVIEW_BYTES)
+def cat_path(path, tail=False, max_bytes=DEFAULT_TEXT_PREVIEW_BYTES):
+    """Always use a bounded text preview; never download full files."""
+    if tail:
+        return inspect_text(path, max_bytes=max_bytes, tail=True)
+    return inspect_text(path, max_bytes=max_bytes)
+
+
+def multi_cat(paths, tail=False, max_bytes=DEFAULT_TEXT_PREVIEW_BYTES):
+    """Read multiple Contents-root text previews in a single browser round trip."""
+    if not paths:
+        raise ValueError("paths_required")
+    if len(paths) > 64:
+        raise ValueError("too_many_paths: limit 64")
+    limit = validate_inspect_bytes(max_bytes)
+    reqs = []
+    meta_by_id = {}
+    external = []
+    for idx, raw_path in enumerate(paths):
+        srv = to_server(raw_path)
+        contents = contents_path(raw_path)
+        key = str(idx)
+        meta_by_id[key] = (raw_path, srv)
+        if contents is None:
+            external.append((key, raw_path, srv))
+        else:
+            reqs.append({
+                "id": key,
+                "kind": "read_range",
+                "path": contents,
+                "mode": "tail" if tail else "head",
+                "max_bytes": limit,
+            })
+    results_map = {}
+    if reqs:
+        res = evaluate_op("batch_http", {"requests": reqs}, timeout=MAX_SYNC_SECONDS)
+        raw_results = (res.get("data") or {}).get("results") or {}
+        for key, item in raw_results.items():
+            _, srv = meta_by_id[key]
+            if isinstance(item, dict) and item.get("ok"):
+                field = "tail" if tail else "head"
+                results_map[key] = {
+                    "ok": True, "format": "text", "path": srv,
+                    "size": item.get("size"), "bytes_read": item.get("bytes_read"),
+                    "truncated": bool(item.get("truncated")),
+                    field: item.get("text", ""),
+                }
+            else:
+                results_map[key] = {
+                    "ok": False, "format": "text", "path": srv,
+                    "error": (item or {}).get("error") if isinstance(item, dict) else "read_failed",
+                    "status": (item or {}).get("status") if isinstance(item, dict) else None,
+                }
+    for key, raw_path, srv in external:
+        entry = inspect_text(raw_path, max_bytes=limit, tail=tail)
+        entry["ok"] = not bool(entry.get("error"))
+        results_map[key] = entry
+    ordered = [results_map[str(i)] for i in range(len(paths))]
+    return {"ok": all(item.get("ok", False) for item in ordered), "count": len(ordered), "files": ordered}
 
 
 def inspect(path, timeout=300):
     raw = fix_msys(path)
-    ext = os.path.splitext(raw.split("?")[0])[1].lower()
+    clean = raw.split("?")[0]
+    low = clean.lower()
+    ext = os.path.splitext(clean)[1].lower()
     srv = to_server(raw)
 
     source, extra = {
@@ -1995,7 +3499,24 @@ def inspect(path, timeout=300):
         ".parquet": (PARQUET, {}),
         ".csv": (TABLE, {"sep": ","}),
         ".tsv": (TABLE, {"sep": "\t"}),
+        ".bam": (BAM_INSPECT, {}),
+        ".fastq": (FASTQ_INSPECT, {}),
+        ".fq": (FASTQ_INSPECT, {}),
+        ".gtf": (GTF_INSPECT, {}),
+        ".gff": (GTF_INSPECT, {}),
+        ".gff3": (GTF_INSPECT, {}),
+        ".paf": (PAF_INSPECT, {}),
+        ".vcf": (VCF_INSPECT, {}),
     }.get(ext, (None, {}))
+    if source is None and ext == ".gz":
+        for suffix, tmpl in (
+            (".fastq.gz", FASTQ_INSPECT), (".fq.gz", FASTQ_INSPECT),
+            (".gtf.gz", GTF_INSPECT), (".gff.gz", GTF_INSPECT), (".gff3.gz", GTF_INSPECT),
+            (".paf.gz", PAF_INSPECT), (".vcf.gz", VCF_INSPECT),
+        ):
+            if low.endswith(suffix):
+                source = tmpl
+                break
     if source is not None:
         return _bounded_inspection_result(
             run_python(source % {"p": srv, **extra}, timeout=min(timeout, MAX_SYNC_SECONDS)),
@@ -2093,15 +3614,70 @@ def _contents_text(contents, server_path, limit):
             "bytes_read": len(text.encode("utf-8")), "truncated": False, "head": text}
 
 
-def inspect_text(path, max_bytes=DEFAULT_TEXT_PREVIEW_BYTES):
-    """Return a byte-bounded text preview; Contents API first, kernel for the rest."""
+def _contents_range_text(contents, server_path, limit, tail=False):
+    """Read bounded head/tail text via HTTP Range without starting a kernel."""
+    value = evaluate_op("read_range", {"path": contents, "mode": "tail" if tail else "head",
+                                       "max_bytes": limit}, timeout=MAX_SYNC_SECONDS)
+    data = value.get("data") or {}
+    text = data.get("text")
+    if data.get("ok") is not True or not isinstance(text, str):
+        return None
+    out = {"format": "text", "path": server_path, "size": data.get("size"),
+           "bytes_read": data.get("bytes_read", len(text.encode("utf-8"))),
+           "truncated": bool(data.get("truncated"))}
+    out["tail" if tail else "head"] = text
+    return out
+
+
+def inspect_text(path, max_bytes=DEFAULT_TEXT_PREVIEW_BYTES, tail=False):
+    """Return a byte-bounded text preview; pure HTTP (Contents/Range) first, kernel for the rest."""
     limit = validate_inspect_bytes(max_bytes)
     srv = to_server(path)
     contents = contents_path(path)
     if contents is not None:
-        preview = _contents_text(contents, srv, limit)
-        if preview is not None:
-            return preview
+        if tail:
+            try:
+                preview = _contents_range_text(contents, srv, limit, tail=True)
+                if preview is not None:
+                    return preview
+            except Bridge as exc:
+                if "status" in str(exc) or "auth" in str(exc) or "read_failed" in str(exc):
+                    raise
+        else:
+            preview = _contents_text(contents, srv, limit)
+            if preview is not None:
+                return preview
+            try:
+                ranged = _contents_range_text(contents, srv, limit, tail=False)
+                if ranged is not None:
+                    return ranged
+            except Bridge:
+                pass
+    if tail:
+        tail_code = _INSPECT_PRELUDE + (
+            "import os, stat\n"
+            f"p=safe_path({srv!r}); limit={limit!r}\n"
+            "try:\n"
+            "    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)\n"
+            "    fd = os.open(p, flags)\n"
+            "    try:\n"
+            "        info = os.fstat(fd)\n"
+            "        if not stat.S_ISREG(info.st_mode): raise ValueError('not_regular_file')\n"
+            "        size = info.st_size\n"
+            "        start = max(0, size - limit)\n"
+            "        os.lseek(fd, start, os.SEEK_SET)\n"
+            "        with os.fdopen(fd, 'rb') as fh:\n"
+            "            fd = None; raw = fh.read(limit)\n"
+            "    finally:\n"
+            "        if fd is not None: os.close(fd)\n"
+            "    out = {'format':'text','path':p,'size':size,'bytes_read':len(raw),'truncated':start>0,"
+            "'tail':raw.decode('utf-8', errors='replace')}\n"
+            "except Exception as exc:\n"
+            "    out = {'format':'text','path':p,'error':'bounded_read_failed','detail':clip(exc)}\n"
+            "emit_summary(out)\n"
+        )
+        response = run_python(tail_code, timeout=MAX_SYNC_SECONDS)
+        return _bounded_inspection_result(response, srv, "text_preview_failed")
     response = run_python(_TEXT_PREVIEW % {"p": srv, "limit": limit}, timeout=MAX_SYNC_SECONDS)
     return _bounded_inspection_result(response, srv, "text_preview_failed")
 
@@ -2183,6 +3759,8 @@ def doctor(deep=False):
         "ok": bool(version and reachable),
         "controller_version": CONTROLLER_VERSION,
         "platform": sys.platform,
+        "controller_platform_supported": os.name == "nt" or sys.platform in ("darwin", "linux"),
+        "controller_lock_backend": "msvcrt" if os.name == "nt" else "fcntl",
         "windows_native_supported": os.name == "nt",
         "python": sys.version.split()[0],
         "bsk_bin": BSK_BIN,
@@ -2361,6 +3939,8 @@ def main(argv):
     p = sub.add_parser("connect", help="connect only to the user-selected workspace URL and confirm its iframe")
     p.add_argument("--url", help="current workspace URL copied after the user manually opens Personal Analysis; "
                                  "a supplied URL is saved only after the live Jupyter probe succeeds")
+    p.add_argument("--refresh", action="store_true",
+                   help="force re-navigating the controller tab to recover from a stuck page or container restart")
     sub.add_parser("status", help="list active bsk sessions")
     sub.add_parser("probe", help="read-only Jupyter env probe")
     p = sub.add_parser("doctor", help="local prerequisite/config preflight (no secrets)")
@@ -2373,6 +3953,14 @@ def main(argv):
                    help="include dotfiles (uses a bounded kernel scan; the Contents view hides them)")
     p = sub.add_parser("cat", help="read a bounded preview; use work/... for /data/work files")
     p.add_argument("path")
+    p.add_argument("--tail", action="store_true", help="read the trailing bytes via pure HTTP Range when possible")
+    p.add_argument("--bytes", dest="max_bytes", type=int, default=DEFAULT_TEXT_PREVIEW_BYTES,
+                   help=f"maximum bytes to read (1-{MAX_INSPECT_BYTES}, default {DEFAULT_TEXT_PREVIEW_BYTES})")
+    p = sub.add_parser("multi-cat", help="read multiple work/... text previews in one browser round trip")
+    p.add_argument("paths", nargs="+", help="1-64 paths to read concurrently")
+    p.add_argument("--tail", action="store_true", help="read trailing bytes of each file")
+    p.add_argument("--bytes", dest="max_bytes", type=int, default=DEFAULT_TEXT_PREVIEW_BYTES,
+                   help=f"maximum bytes per file (1-{MAX_INSPECT_BYTES}, default {DEFAULT_TEXT_PREVIEW_BYTES})")
     p = sub.add_parser("write", help="atomically create UTF-8 text under work/...; no-clobber by default")
     p.add_argument("path", help="target under work/... (server /data/work/...)")
     g = p.add_mutually_exclusive_group(required=True)
@@ -2384,10 +3972,30 @@ def main(argv):
     p.add_argument("--out", required=True, help="local destination path")
     p.add_argument("--overwrite", action="store_true", help="replace an existing local file")
     p.add_argument("--no-verify", action="store_true", help="skip the remote sha256 comparison")
-    p = sub.add_parser("put", help="upload a local file under the Contents root (<= 4 MiB)")
+    p = sub.add_parser("put", help="upload a local file under the Contents root (<= 4 MiB, or <= 64 MiB with --allow-large)")
     p.add_argument("local", help="local source path")
     p.add_argument("--remote", required=True, help="work/... destination under the Contents root")
     p.add_argument("--overwrite", action="store_true", help="replace an existing remote file")
+    p.add_argument("--allow-large", action="store_true",
+                   help=f"use chunked Contents HTTP upload up to {MAX_CHUNKED_UPLOAD_BYTES // (1024 * 1024)} MiB")
+
+    p = sub.add_parser("sync-up", help="bundle and atomically sync a local directory to work/...")
+    p.add_argument("local_dir", help="local directory to upload")
+    p.add_argument("--remote", required=True, help="remote destination directory under work/...")
+    p.add_argument("--exclude", action="append", default=[], help="glob pattern to exclude (repeatable)")
+    p.add_argument("--no-chmod-sh", action="store_true", help="do not auto-chmod +x on *.sh files")
+
+    p = sub.add_parser("sync-down", help="download matching files from a remote directory tree")
+    p.add_argument("remote_dir", help="remote directory under work/...")
+    p.add_argument("--out", required=True, help="local destination directory")
+    p.add_argument("--glob", dest="glob_patterns", default="*",
+                   help="comma-separated filename/relative-path globs, e.g. '*.tsv,*.pdf,*.png'")
+    p.add_argument("--overwrite", action="store_true", help="overwrite existing local files")
+    p.add_argument("--skip-existing", action="store_true", help="skip local files matching remote size")
+    p.add_argument("--no-verify", action="store_true", help="skip remote sha256 verification")
+    p.add_argument("--max-files", type=int, default=100, help="maximum files to download (1-500)")
+
+    sub.add_parser("host-health", help="check server CPU/cgroup/load/memory/disk speed and compute routing advice")
 
     p = sub.add_parser("run-python")
     g = p.add_mutually_exclusive_group(required=True)
@@ -2411,18 +4019,47 @@ def main(argv):
                    help="reuse this key to get the same job id; a retried submit does not start a second job")
     p.add_argument("--cwd", default=WORK_ROOT,
                    help="server working directory for the payload (default: /data/work)")
+    p.add_argument("--threads", type=int,
+                   help="pin OPENBLAS/OMP/MKL/NUMEXPR_NUM_THREADS to N (1-256) to avoid shared-host thrashing")
+    p.add_argument("--local-tmp", action="store_true",
+                   help="create private /tmp/sn_job_<id> as TMPDIR and clean it up automatically on exit")
     p = sub.add_parser("jobs", help="job registry: server job dirs merged with local receipts")
     p.add_argument("--remote", action="store_true", help="also scan /data/work/agent_jobs")
     p.add_argument("--limit", type=int, default=20)
     p = sub.add_parser("prune", help="delete finished job dirs older than N days (never a live owner)")
     p.add_argument("--days", type=int, default=7, help="age threshold in days (default: 7)")
     p.add_argument("--dry-run", action="store_true", help="report what would be removed")
+    p.add_argument("--batch", dest="batch_id", help="limit cleanup to finished jobs belonging to one batch ID")
+
+    bp = sub.add_parser("batch", help="server-side multi-sample batch queue orchestration")
+    bsub = bp.add_subparsers(dest="batch_command", required=True)
+    p = bsub.add_parser("submit", help="submit a manifest-driven multi-sample batch with concurrency control")
+    p.add_argument("--batch", dest="batch_id", required=True, help="unique batch identifier")
+    p.add_argument("--manifest", required=True, help="local TSV, CSV, or JSON manifest with a sample_id column")
+    p.add_argument("--cmd-template", required=True, help="shell command template using {column} placeholders")
+    p.add_argument("--cwd", default=WORK_ROOT, help="server working directory for each sample")
+    p.add_argument("--max-concurrent", type=int, default=2, help="max simultaneous sample workers (1-64)")
+    p.add_argument("--threads", type=int, help="pin BLAS/OpenMP threads per sample (1-256)")
+    p.add_argument("--local-tmp", action="store_true", help="assign private auto-cleaned /tmp TMPDIR per sample")
+    p = bsub.add_parser("status", help="kernel-free HTTP dashboard for a batch")
+    p.add_argument("batch_id")
+    p.add_argument("--logs", action="store_true", help="also include stderr tails for running samples")
+    p.add_argument("--tail-bytes", type=int, default=2048)
+    p = bsub.add_parser("retry-failed", help="re-queue only failed/cancelled samples of a batch")
+    p.add_argument("batch_id")
+    p.add_argument("--max-concurrent", type=int, help="override concurrency for the retry generation")
+    p = bsub.add_parser("cancel", help="gracefully stop a running batch queue and its active workers")
+    p.add_argument("batch_id")
     p = sub.add_parser("cancel", help="SIGTERM a job whose PID still belongs to its job directory")
     p.add_argument("job_id")
     p = sub.add_parser("accept", help="record that a job's result was accepted")
     p.add_argument("job_id")
     p.add_argument("--note")
-    p = sub.add_parser("poll"); p.add_argument("job_id"); p.add_argument("--tail", type=int, default=40)
+    p = sub.add_parser("poll")
+    p.add_argument("job_id")
+    p.add_argument("--tail", type=int, default=40)
+    p.add_argument("--lite", action="store_true",
+                   help="kernel-free pure-HTTP poll (reads status/stage/heartbeat/log tails in one call)")
     p = sub.add_parser("artifacts", help="inventory regular files under a job's artifacts directory")
     p.add_argument("job_id")
 
@@ -2430,6 +4067,10 @@ def main(argv):
 
     a = ap.parse_args(argv)
     session_id = a.session
+    if session_id is None and a.subcmd != "session":
+        env_session = os.environ.get("SN_SESSION", "").strip()
+        if env_session:
+            session_id = env_session
     try:
         if a.subcmd == "session":
             if session_id:
@@ -2458,7 +4099,10 @@ def _dispatch(a):
             supplied_url = canonical_workspace_url(a.url) if getattr(a, "url", None) else None
             if supplied_url:
                 set_runtime_url(supplied_url)
-            tab_id = ensure_tab(full_probe=True)
+            if getattr(a, "refresh", False):
+                tab_id = ensure_tab(force=True, full_probe=True)
+            else:
+                tab_id = ensure_tab(full_probe=True)
             if supplied_url:
                 save_url(supplied_url)
             state = _browser_state()
@@ -2472,7 +4116,9 @@ def _dispatch(a):
         elif a.subcmd == "ls":
             return _emit(list_path(a.path, include_hidden=a.all))
         elif a.subcmd == "cat":
-            return _emit(cat_path(a.path))
+            return _emit(cat_path(a.path, tail=a.tail, max_bytes=a.max_bytes))
+        elif a.subcmd == "multi-cat":
+            return _emit(multi_cat(a.paths, tail=a.tail, max_bytes=a.max_bytes))
         elif a.subcmd == "write":
             content = a.content
             if a.content_file:
@@ -2483,7 +4129,16 @@ def _dispatch(a):
             return _emit(get_file(a.remote, a.out, overwrite=a.overwrite,
                                   verify=not a.no_verify))
         elif a.subcmd == "put":
-            return _emit(put_file(a.local, a.remote, overwrite=a.overwrite))
+            return _emit(put_file(a.local, a.remote, overwrite=a.overwrite, allow_large=a.allow_large))
+        elif a.subcmd == "sync-up":
+            return _emit(sync_up(a.local_dir, a.remote, excludes=a.exclude,
+                                 chmod_scripts=not a.no_chmod_sh))
+        elif a.subcmd == "sync-down":
+            return _emit(sync_down(a.remote_dir, a.out, glob_patterns=a.glob_patterns,
+                                   overwrite=a.overwrite, verify=not a.no_verify,
+                                   max_files=a.max_files, skip_existing=a.skip_existing))
+        elif a.subcmd == "host-health":
+            return _emit(host_health())
         elif a.subcmd == "run-python":
             code = a.code if a.code is not None else read_local_text(
                 a.code_file, MAX_CODE_BYTES, "python_code_too_large")
@@ -2494,17 +4149,31 @@ def _dispatch(a):
             return _emit(inspect(a.path, timeout=a.timeout))
         elif a.subcmd == "submit":
             _print(submit(a.cmd, name=a.name, cwd=a.cwd,
-                          idempotency_key=a.idempotency_key))
+                          idempotency_key=a.idempotency_key,
+                          threads=a.threads, local_tmp=a.local_tmp))
         elif a.subcmd == "jobs":
             return _emit(list_jobs(limit=a.limit, remote=a.remote))
         elif a.subcmd == "prune":
-            return _emit(prune_jobs(days=a.days, dry_run=a.dry_run))
+            return _emit(prune_jobs(days=a.days, dry_run=a.dry_run, batch_id=a.batch_id))
+        elif a.subcmd == "batch":
+            if a.batch_command == "submit":
+                return _emit(batch_submit(
+                    a.batch_id, a.manifest, a.cmd_template, cwd=a.cwd,
+                    max_concurrent=a.max_concurrent, threads=a.threads,
+                    local_tmp=a.local_tmp,
+                ))
+            if a.batch_command == "status":
+                return _emit(batch_status(a.batch_id, include_logs=a.logs, tail_bytes=a.tail_bytes))
+            if a.batch_command == "retry-failed":
+                return _emit(batch_retry_failed(a.batch_id, max_concurrent=a.max_concurrent))
+            if a.batch_command == "cancel":
+                return _emit(batch_cancel(a.batch_id))
         elif a.subcmd == "cancel":
             return _emit(cancel_job(a.job_id))
         elif a.subcmd == "accept":
             return _emit(accept_job(a.job_id, note=a.note))
         elif a.subcmd == "poll":
-            return _emit(poll(a.job_id, tail=a.tail))
+            return _emit(poll(a.job_id, tail=a.tail, lite=a.lite))
         elif a.subcmd == "artifacts":
             return _emit(artifacts(a.job_id))
         elif a.subcmd == "close":

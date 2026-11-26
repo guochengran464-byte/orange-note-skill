@@ -17,7 +17,8 @@ self-hosted Jupyter servers require a connector adaptation.
 | BrowserSkill CLI 0.3.2 / Edge extension 0.3.3 | Used for live verification |
 | BrowserSkill CLI / daemon / Edge extension 0.4.0 | Live connection and independent sessions tested in v4.2.0 |
 | Linux workspace with Jupyter REST/WebSocket APIs | Tested through the built-in connector |
-| macOS/Linux/WSL as the local controller | Unverified |
+| macOS Apple Silicon as the local controller | Local adaptation: CLI/daemon/Edge extension 0.4.2, DCS/Jupyter probe and Python execution verified; see docs/MACOS.md |
+| Linux/WSL as the local controller | Unverified |
 | Other browser profiles, new CLI/extension versions | Re-run the smoke checks before relying on them |
 
 For symbolic-link downloads, size discrepancy detection requires a server that
